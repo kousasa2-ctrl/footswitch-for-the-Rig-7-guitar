@@ -7,6 +7,7 @@ PlayerService
 import os
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
@@ -248,21 +249,21 @@ class PlayerService:
                 # Останавливаем текущий трек
                 self._stop()
 
-                # Устанавливаем новый трек
+                track = self._tracks[track_id]
                 self._current_track_id = track_id
                 self._position = 0.0
-                self._duration = 0.0
+                self._duration = track.duration if track.duration > 0 else 1.0
 
-                # Запускаем воспроизведение
                 self._state = PlayerState.PLAYING
                 self._stop_event.clear()
+                self._track_queue.put(track_id)
 
-                # Запускаем поток воспроизведения
-                self._playback_thread = threading.Thread(
-                    target=self._playback_loop,
-                    daemon=True
-                )
-                self._playback_thread.start()
+                if not self._playback_thread or not self._playback_thread.is_alive():
+                    self._playback_thread = threading.Thread(
+                        target=self._playback_loop,
+                        daemon=True
+                    )
+                    self._playback_thread.start()
 
                 if self.logger:
                     self.logger.log_player(f"Воспроизведение: {track_id}", "info")
@@ -434,6 +435,47 @@ class PlayerService:
                 'total_tracks': 0
             }
 
+    def get_playlist(self) -> List[Dict[str, Any]]:
+        """Список треков для UI"""
+        return [t.to_dict() for t in self.get_all_tracks()]
+
+    def load_track(self, track_id: str) -> bool:
+        """Загрузка трека для воспроизведения"""
+        return self.play_track(track_id)
+
+    def play(self) -> bool:
+        """Запуск или возобновление воспроизведения"""
+        if self._state == PlayerState.PAUSED:
+            self.resume()
+            return True
+
+        current = self.get_current_track()
+        if current:
+            return self.play_track(current.id)
+        return False
+
+    def prev(self) -> Optional[str]:
+        """Переход к предыдущему треку"""
+        prev_id = self.prev_track()
+        if prev_id:
+            self.play_track(prev_id)
+        return prev_id
+
+    def next(self) -> Optional[str]:
+        """Переход к следующему треку"""
+        next_id = self.next_track()
+        if next_id:
+            self.play_track(next_id)
+        return next_id
+
+    def get_status(self) -> Dict[str, Any]:
+        """Статус для совместимости API"""
+        return self.get_state()
+
+    def set_position(self, value: float) -> None:
+        """Установка позиции воспроизведения"""
+        self.seek(value)
+
     def _playback_loop(self) -> None:
         """Цикл воспроизведения"""
         while not self._stop_event.is_set():
@@ -446,12 +488,12 @@ class PlayerService:
                 track = self._tracks[track_id]
                 self._current_track_id = track_id
                 self._position = 0.0
-                self._duration = track.duration
+                self._duration = track.duration if track.duration > 0 else 1.0
 
-                # В реальном приложении здесь будет воспроизведение через sounddevice
-                # Для тестирования используем симуляцию
                 while not self._stop_event.is_set() and self._position < self._duration:
                     time.sleep(0.1)
+                    if self._state == PlayerState.PAUSED:
+                        continue
                     self._position += 0.1
 
                 # Трек закончился

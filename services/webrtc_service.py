@@ -5,6 +5,7 @@ WebRTCService
 """
 
 import threading
+import traceback
 from typing import Optional, Dict, Any, Callable
 from webrtc.stream import WebRTCStream
 from core.state_manager import StateManager

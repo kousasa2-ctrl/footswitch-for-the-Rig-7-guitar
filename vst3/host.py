@@ -2,10 +2,12 @@
 VST3 Host
 =========
 Основной класс для управления VST3 хостингом.
+Auto-detection VST3 плагинов.
 """
 
 import threading
 import numpy as np
+from pathlib import Path
 from typing import Optional, Callable, List
 from .plugin import VST3Plugin
 
@@ -21,6 +23,54 @@ class VST3Host:
         self._running = False
         self._lock = threading.Lock()
         self._callback: Optional[Callable] = None
+        self._plugin_path: Optional[str] = None
+
+    def _find_plugin_path(self) -> Optional[str]:
+        """
+        Поиск пути к VST3 плагину.
+        Приоритет:
+        1. auto-detection в рабочей директории
+        2. путь из config.ini (override)
+        3. fallback поиск *.vst3 в plugins/
+
+        Returns:
+            Optional[str]: Абсолютный путь к плагину или None
+        """
+        search_paths = [
+            Path("./plugins/Guitar Rig 7.vst3"),
+            Path("plugins/Guitar Rig 7.vst3"),
+            Path.cwd() / "plugins" / "Guitar Rig 7.vst3"
+        ]
+
+        for search_path in search_paths:
+            if search_path.exists():
+                found_path = str(search_path.resolve())
+                if self.logger:
+                    self.logger.log_vst(f"Guitar Rig 7.vst3 найден: {found_path}", "info")
+                return found_path
+
+        config_path = self.config.get('vst3', 'path')
+        if config_path:
+            config_file = Path(config_path)
+            if config_file.exists():
+                found_path = str(config_file.resolve())
+                if self.logger:
+                    self.logger.log_vst(f"Guitar Rig 7.vst3 найден в config.ini: {found_path}", "info")
+                return found_path
+            else:
+                if self.logger:
+                    self.logger.log_vst(f"Путь из config.ini не существует: {config_path}", "warning")
+
+        plugins_dir = Path.cwd() / "plugins"
+        if plugins_dir.exists():
+            vst3_files = sorted(plugins_dir.glob("*.vst3"))
+            if vst3_files:
+                found_path = str(vst3_files[0].resolve())
+                if self.logger:
+                    self.logger.log_vst(f"VST3 плагин найден через fallback поиск: {found_path}", "info")
+                return found_path
+
+        return None
 
     def initialize(self) -> bool:
         """
@@ -29,26 +79,36 @@ class VST3Host:
         Returns:
             bool: True если успешно
         """
-        try:
-            plugin_path = self.config.get('vst3', 'path')
-            if not plugin_path:
-                if self.logger:
-                    self.logger.log_vst("Путь к VST3 плагину не указан", "error")
-                return False
+        plugin_path = self._find_plugin_path()
 
+        if not plugin_path:
+            if self.logger:
+                self.logger.log_vst("Guitar Rig 7.vst3 не найден", "error")
+            return False
+
+        if self.logger:
+            self.logger.log_vst(f"Найден plugin: {plugin_path}", "info")
+
+        try:
+            self._plugin_path = plugin_path
             self.plugin = VST3Plugin(plugin_path, self.logger)
 
             if not self.plugin.load():
+                if self.plugin.plugin is None:
+                    if self.logger:
+                        self.logger.log_vst("pedalboard вернул None", "error")
+                else:
+                    if self.logger:
+                        self.logger.log_vst("Ошибка загрузки плагина", "error")
                 return False
 
             if self.logger:
-                self.logger.log_vst("VST3 хост инициализирован", "success")
-
+                self.logger.log_vst("Plugin loaded successfully", "success")
             return True
 
         except Exception as e:
             if self.logger:
-                self.logger.log_vst(f"Ошибка инициализации VST3 хоста: {e}", "error")
+                self.logger.log_vst(f"Ошибка загрузки: {e}", "error")
             return False
 
     def start_audio_thread(self, callback: Callable) -> None:

@@ -5,6 +5,7 @@ PluginService
 """
 
 import threading
+import traceback
 from typing import Optional, Dict, Any, List
 from vst3.host import VST3Host
 from core.state_manager import StateManager

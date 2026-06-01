@@ -31,11 +31,15 @@ class VST3Plugin:
                 self.logger.log_vst(f"Загрузка плагина: {self.plugin_path}")
 
             self._plugin = load_plugin(self.plugin_path)
-            self._is_loaded = True
+            if self._plugin is None:
+                if self.logger:
+                    self.logger.log_vst("pedalboard вернул None", "error")
+                self._is_loaded = False
+                return False
 
+            self._is_loaded = True
             if self.logger:
                 self.logger.log_vst("Плагин успешно загружен", "success")
-
             return True
 
         except Exception as e:
@@ -131,21 +135,28 @@ class VST3Plugin:
         if not self._is_loaded or self._plugin is None:
             return {}
 
-        params = {}
         try:
+            params = {}
             for attr in dir(self._plugin):
-                if not attr.startswith('_') and not callable(getattr(self._plugin, attr)):
+                if attr.startswith('_'):
+                    continue
+
+                try:
+                    value = getattr(self._plugin, attr)
+                except Exception:
+                    continue
+
+                if isinstance(value, (int, float)):
                     try:
-                        value = getattr(self._plugin, attr)
-                        if isinstance(value, (int, float)):
-                            params[attr] = float(value)
-                    except:
-                        pass
+                        params[attr] = float(value)
+                    except Exception:
+                        continue
+
+            return params
         except Exception as e:
             if self.logger:
-                self.logger.log_vst(f"Ошибка получения параметров: {e}", "error")
-
-        return params
+                self.logger.log_vst(f"Ошибка получения параметров: {e}", "warning")
+            return {}
 
     def get_info(self) -> Dict[str, Any]:
         """

@@ -6,6 +6,7 @@ REST API для мобильного клиента.
 
 import json
 import threading
+import traceback
 from typing import Optional, Dict, Any, Callable
 from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -155,10 +156,9 @@ class APIServer:
             port = int(self.config.get('wifi', 'port', '5000'))
             handler = partial(APIHandler, api_server=self)
             self._server = HTTPServer(('0.0.0.0', port), handler)
-            self._running = True
 
             if self.logger:
-                self.logger.log_api(f"API сервер запущен на порту {port}", "info")
+                self.logger.log_api(f"API сервер инициализирован на порту {port}", "info")
 
             return True
 
@@ -476,18 +476,25 @@ class APIServer:
                 self.logger.log_api(f"Ошибка обработки транспорта: {e}", "error")
             return APIResponse.error(str(e))
 
-    def start(self) -> None:
+    def start(self) -> bool:
         """Запуск сервера"""
         try:
             with self._lock:
                 if self._running:
-                    return
+                    return True
 
+                if self._server is None:
+                    if not self.initialize():
+                        return False
+
+                self._running = True
                 self._thread = threading.Thread(target=self._run, daemon=True)
                 self._thread.start()
+                return True
         except Exception as e:
             if self.logger:
                 self.logger.log_api(f"Ошибка запуска сервера: {e}", "error")
+            return False
 
     def _run(self) -> None:
         """Запуск сервера в потоке"""

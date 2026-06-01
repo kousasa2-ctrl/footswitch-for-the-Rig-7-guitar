@@ -7,6 +7,7 @@ PresetCatalog
 import os
 import json
 import threading
+import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Iterator
 from datetime import datetime

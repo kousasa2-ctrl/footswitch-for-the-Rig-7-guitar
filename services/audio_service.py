@@ -80,6 +80,13 @@ class AudioService:
             return self.engine.process_audio(input_data)
         return input_data
 
+    def configure_device(self, driver_name: str) -> bool:
+        """Попытка конфигурации аудио устройства"""
+        self.logger.log_audio(
+            f"Конфигурация аудио драйвера '{driver_name}' не поддерживается текущим движком", "warning"
+        )
+        return False
+
     def get_status(self) -> dict:
         """Получение статуса"""
         if self.engine:

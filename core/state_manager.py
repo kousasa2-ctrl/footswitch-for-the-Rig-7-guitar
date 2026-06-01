@@ -10,7 +10,7 @@ from enum import Enum
 import threading
 
 
-class SystemState(Enum):
+class SystemStateEnum(Enum):
     """Состояния системы"""
     IDLE = "idle"
     INITIALIZING = "initializing"
@@ -23,7 +23,7 @@ class SystemState(Enum):
 @dataclass
 class SystemState:
     """Состояние системы"""
-    state: SystemState = SystemState.IDLE
+    state: SystemStateEnum = SystemStateEnum.IDLE
     plugin_loaded: bool = False
     audio_engine_active: bool = False
     midi_active: bool = False
@@ -33,7 +33,7 @@ class SystemState:
     error_message: Optional[str] = None
     _lock = threading.Lock()
 
-    def set_state(self, new_state: SystemState) -> None:
+    def set_state(self, new_state: SystemStateEnum) -> None:
         """Установка нового состояния"""
         with self._lock:
             self.state = new_state
@@ -66,7 +66,7 @@ class SystemState:
     def set_error(self, message: str) -> None:
         """Установка сообщения об ошибке"""
         with self._lock:
-            self.state = SystemState.ERROR
+            self.state = SystemStateEnum.ERROR
             self.error_message = message
 
     def get_state_dict(self) -> Dict[str, Any]:
