@@ -149,6 +149,7 @@ class APIServer:
         self._lock = threading.Lock()
         self._message_queue: queue.Queue = queue.Queue()
         self._thread: Optional[threading.Thread] = None
+        self._host = '0.0.0.0'  # Явный bind host без DNS lookup
 
     def initialize(self) -> bool:
         """Инициализация сервера"""

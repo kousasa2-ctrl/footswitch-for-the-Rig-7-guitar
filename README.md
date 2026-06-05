@@ -1,240 +1,283 @@
-# GR7 Hub - Guitar Rig 7 Control Hub
+# GR7 Hub - Production-Grade Architecture
 
-Серверная часть Guitar Rig 7 Hub с VST3 хостингом, каталогом пресетов и мобильным управлением.
+## Overview
 
-## 🎸 Архитектура
+GR7 Hub is a modular, async-first control center for Guitar Rig 7 with real-time audio processing, Firebase integration, BLE pairing, WebRTC streaming, and QR-based session management.
+
+## Architecture Principles
+
+### Main Thread = GUI ONLY
+- **No heavy imports** in main thread (aiortc, pedalboard, sounddevice, bleak, firebase-admin)
+- **No blocking operations** in main thread (disk scan, QR generation, VST introspection)
+- **UI shows instantly** (< 2 seconds startup)
+
+### Service-Oriented Architecture
+Each service is:
+- **Independent** - failure doesn't cascade
+- **Async-first** - `async start()`, `async stop()`, `async healthcheck()`
+- **Configurable** - enable/disable via `config.ini`
+- **Observable** - health monitoring, status reporting
+
+### Lazy Loading
+- Heavy libraries imported only when service starts
+- aiortc imported on-demand in WebRTC service
+- pedalboard imported in Audio service
+- sounddevice imported in Audio service
+
+## Project Structure
 
 ```
 GR7 Hub/
-├── api/                    # API сервер для мобильного клиента
+├── main.py                    # Entry point - minimal, shows UI instantly
+├── config.ini                 # Configuration (services, audio, MIDI, etc.)
+├── serviceAccountKey.json     # Firebase credentials
+├── requirements.txt           # Dependencies
+├── core/                      # Core infrastructure
+│   ├── __init__.py           # Exports: Logger, ServiceManager, ServiceState, ServiceHealth
+│   ├── logger.py             # Multi-channel logging (BOOT, AUDIO, FIREBASE, etc.)
+│   ├── config_loader.py      # INI config with service enable/disable
+│   ├── service_states.py     # ServiceState, ServiceHealth enums
+│   ├── service_manager.py    # Service lifecycle, dependencies, health monitoring
+│   ├── bootstrap.py          # Phased startup with timeouts, isolation
+│   ├── async_utils.py        # RingBuffer, SnapshotStore, run_in_executor, AsyncTaskGroup
+│   ├── diagnostics.py        # Freeze detection, deadlock detection
+│   └── state_manager.py      # Global state management
+├── audio/                     # Real-time audio engine
 │   ├── __init__.py
-│   └── server.py           # REST API endpoints
-├── core/                   # Ядро приложения
-│   ├── config_loader.py
-│   ├── logger.py
-│   └── state_manager.py
-├── services/               # Сервисы
+│   ├── realtime_engine.py    # Lock-free audio callback, ASIO support
+│   └── pedalboard_processor.py # Pedalboard/Guitar Rig VST3 processing
+├── services/                  # Modular services
+│   ├── __init__.py           # Lightweight exports, factories, registry
+│   ├── audio_service.py      # Audio engine service (ASIO, 48kHz, 64 block)
+│   ├── firebase_service.py   # Firebase REST sessions (Spark plan friendly)
+│   ├── qr_service.py         # Session-based QR codes with isolated cache
+│   ├── ble_service.py        # BLE GATT for pairing/room join (no audio)
+│   ├── webrtc_service.py     # WebRTC with lazy aiortc, graceful degradation
+│   ├── preset_catalog.py     # Async preset scan, indexed cache, checksums
+│   └── player_service.py     # Backing track player, VU meter, waveform
+├── ui/                        # PyQt6 GUI
 │   ├── __init__.py
-│   ├── plugin_service.py   # VST3 плагин
-│   ├── preset_catalog.py   # Каталог пресетов
-│   ├── player_service.py   # Backing track player
-│   ├── audio_service.py
-│   ├── midi_service.py
-│   └── webrtc_service.py   # WebRTC соединение
-├── vst3/                   # VST3 хостинг
+│   └── main_window.py        # Dashboard, Audio Monitor, Presets, Player, Settings, Logs
+├── vst3/                      # VST3 host integration
+│   ├── __init__.py
 │   ├── host.py
 │   └── plugin.py
-├── audio/                  # Аудио движок
-│   ├── engine.py
-│   └── device.py
-├── midi/                   # MIDI
-│   ├── router.py
-│   └── virtual_midi.py
-├── webrtc/                 # WebRTC
+├── webrtc/                    # WebRTC signaling
+│   ├── __init__.py
 │   ├── signaling.py
 │   └── stream.py
-├── utils/                  # Утилиты
+├── api/                       # REST API server
+│   ├── __init__.py
+│   └── server.py
+├── midi/                      # MIDI routing
+│   ├── __init__.py
+│   ├── router.py
+│   └── virtual_midi.py
+├── plugins/                   # VST3 plugins & presets
+│   ├── Guitar Rig 7.vst3
+│   └── presets/
+├── utils/                     # Utilities
+│   ├── __init__.py
 │   ├── audio_utils.py
-│   └── qr_generator.py
-├── main.py                 # GUI приложение
-└── config.ini              # Конфигурация
+│   ├── qr_generator.py
+│   └── safe_import.py
+└── cache/                     # Runtime caches
+    ├── preset_index.json
+    └── .qr_cache/
 ```
 
-## 🚀 Основные возможности
+## Service Configuration
 
-### 1. Загрузка Guitar Rig 7.vst3
-- Загружает VST3 плагин из указанного пути
-- Проверяет реальное состояние загрузки
-- Отдает статус через API
-
-### 2. Каталог пресетов
-- Автоматическое сканирование папок с пресетами (.nkp файлы)
-- Категории: заводские, пользовательские, избранные, недавние
-- Поиск по названию
-- Кэширование избранных и недавних пресетов
-- API для мобильного клиента
-
-### 3. Backing Track Player
-- Воспроизведение MP3, WAV, FLAC, OGG, M4A
-- Управление громкостью
-- Next/Prev треки
-- Статус воспроизведения
-
-### 4. API для мобильного клиента
-```
-GET    /api/presets              - Список пресетов
-GET    /api/presets/current      - Текущий пресет
-POST   /api/presets/select       - Выбор пресета
-POST   /api/presets/next         - Следующий пресет
-POST   /api/presets/prev         - Предыдущий пресет
-GET    /api/presets/favorites    - Избранные
-GET    /api/presets/recent       - Недавние
-GET    /api/presets/rack         - Rack chain
-GET    /api/presets/parameters   - Параметры
-
-GET    /api/player/status        - Статус плеера
-POST   /api/player/play          - Воспроизвести
-POST   /api/player/stop          - Стоп
-POST   /api/player/pause         - Пауза
-POST   /api/player/next          - Следующий трек
-POST   /api/player/prev          - Предыдущий трек
-POST   /api/player/volume        - Громкость
-GET    /api/player/tracks        - Список треков
-
-GET    /api/plugin/status        - Статус плагина
-GET    /api/plugin/presets       - Все пресеты плагина
-GET    /api/plugin/current       - Текущий пресет
-GET    /api/plugin/rack          - Rack chain
-GET    /api/plugin/parameters    - Параметры
-
-GET    /api/status               - Полный статус
-GET    /api/transport            - Транспорт
-```
-
-### 5. WebRTC соединение
-- Создание комнат для подключения
-- QR Code для быстрого подключения
-- Статус соединения
-
-## 📱 Мобильный клиент
-
-Телефон НЕ хранит всю библиотеку пресетов. Сервер отдает только нужные данные:
-
-1. **Получение каталога**: `GET /api/presets?category=factory&limit=50`
-2. **Выбор пресета**: `POST /api/presets/select` с `{"id": "factory_AmpClean"}`
-3. **Текущее состояние**: `GET /api/transport`
-
-## 🎨 GUI в стиле Guitar Rig 7
-
-- Темная тема
-- Профессиональный дизайн
-- Русский интерфейс
-- Вкладки: Пресеты, Плеер, Транспорт, Сеть, Настройки
-
-## ⚙️ Конфигурация
+Edit `config.ini` to enable/disable services:
 
 ```ini
-[wifi]
-api_key = MY_SECRET_KEY_2026
-port = 5000
-
-[gr7]
-preset_folder = C:/Users/Саша/Desktop/песни шансик
-songs = C:/Users/Саша/Desktop/песни шансик
-
-[paths]
-vst3_path = F:/RIG-7-Guitar-Tone-Switch-main/plugins/Guitar Rig 7.vst3
+[services]
+audio = true
+firebase = false
+webrtc = false
+ble = false
+api_server = true
+qr = true
+midi = false
+preset_scan = true
+player = true
+vst3 = true
 ```
 
-## 📦 Установка зависимостей
+## Key Features
+
+### Audio Engine
+- **ASIO only** (Windows) - no MME/DirectSound
+- **48kHz / 64 samples / float32** - ultra-low latency
+- **Lock-free callback** - ring buffers, snapshots
+- **Pedalboard + VST3** - Guitar Rig 7 processing
+- **WebRTC streaming** - simultaneous local + remote output
+
+### Firebase Integration
+- **REST sessions only** - no persistent streams (Spark plan limits)
+- **Session isolation** - users can't see each other
+- **Room structure**: `rooms/{room_id}/{owner,clients,commands,webrtc,audio}`
+
+### QR System
+- **Session-based** - new UUID, nonce, pairing token per launch
+- **Isolated cache** - `.qr_cache/{session_uuid}/{qr.png, metadata.json}`
+- **Async generation** - never blocks main thread
+
+### BLE
+- **GATT services**: Session, Pairing, Room, Status characteristics
+- **Pairing only** - no audio streaming over BLE
+- **Room join** - exchange Firebase room ID via BLE
+
+### WebRTC
+- **Lazy aiortc import** - 10s timeout, graceful degradation
+- **Signaling via Firebase** - offer/answer/ICE candidates
+- **Audio track** - streams from audio engine ring buffer
+
+### Preset Catalog
+- **Async background scan** - doesn't block startup
+- **Indexed cache** - `cache/preset_index.json` with checksums
+- **Incremental updates** - only changed files re-parsed
+- **Categories**: Factory, User, Favorites, Recent
+
+### Player
+- **Real audio decoding** - soundfile (MP3, WAV, FLAC, OGG)
+- **VU meter** - RMS + peak detection, clipping indicator
+- **Waveform** - cached downsampled data
+- **Playlist** - next/prev, seek, volume
+
+## Bootstrap Phases
+
+1. **CORE_SERVICES** - Audio, Player (critical)
+2. **EXTENDED_SERVICES** - Firebase, QR, BLE, WebRTC, Preset Scan, API Server
+3. **BACKGROUND_TASKS** - Preset scanning, cache warming
+
+Each service:
+- Has 30s timeout
+- Isolated try/except
+- Health state tracking
+- Degraded mode support
+
+## Service States
+
+```
+STARTING → RUNNING → DEGRADED → FAILED
+                ↓
+             STOPPED
+                ↓
+             DISABLED
+```
+
+## Health Levels
+
+- **HEALTHY** - Fully operational
+- **DEGRADED** - Running with limitations (e.g., aiortc unavailable)
+- **UNHEALTHY** - Not running or critical failure
+
+## Running
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
-```
 
-## 🎯 Как это работает
-
-1. **При запуске**:
-   - Загружается VST3 плагин Guitar Rig 7.vst3
-   - Сканируются папки с пресетами
-   - Загружаются backing tracks
-   - Запускается API сервер на порту 5000
-
-2. **На ПК**:
-   - Вкладка "Пресеты" показывает список и rack chain
-   - Вкладка "Плеер" управляет backing tracks
-   - Вкладка "Сеть" создает WebRTC комнату
-
-3. **На телефоне**:
-   - Открывает API URL (http://localhost:5000)
-   - Получает список пресетов
-   - Выбирает preset
-   - Управляет плеером
-
-## 🔧 Изменения в коде
-
-### Созданные файлы:
-- `services/preset_catalog.py` - Серверный каталог пресетов
-- `services/player_service.py` - Backing track player
-- `api/server.py` - REST API сервер
-- `api/__init__.py` - Интеграция API
-
-### Обновленные файлы:
-- `services/plugin_service.py` - Интеграция с PresetCatalog
-- `services/webrtc_service.py` - Упрощение, добавлен callback
-- `main.py` - Полная переработка GUI
-- `services/__init__.py` - Добавлены новые сервисы
-
-## ⚠️ Ограничения VST3 API
-
-Guitar Rig 7 VST3 API может ограничивать доступ к:
-- Rack chain (информация может быть недоступна)
-- Параметрам (только для некоторых модулей)
-- Программному changes (0-127)
-
-Если VST3 API не дает полный доступ, каталог пресетов строится на основе файлов на диске.
-
-## 📝 Логирование
-
-Логи честные, без fake success сообщений:
-- `[VST3] Плагин загружен` - только если плагин реально загружен
-- `[PLUGIN] Пресет переключен: 5` - только если переключение успешно
-- `[API] API сервер запущен на порту 5000` - только если сервер реально запущен
-
-## 🎯 Критические правила соблюдены
-
-✅ Не используется pyautogui
-✅ Не используется OpenCV
-✅ Не используется поиск PNG
-✅ Не используется Win32 click automation
-✅ Не используется Ctrl+O
-✅ Не используется имитация мышки
-✅ Не используются fake success logs
-✅ Работает через VST3 host / plugin control / program change
-
-## 📞 API Endpoints
-
-### Пресеты
-- `GET /api/presets` - список всех пресетов с пагинацией
-- `GET /api/presets/current` - текущий пресет
-- `POST /api/presets/select` - выбор пресета
-- `POST /api/presets/next` - следующий пресет
-- `POST /api/presets/prev` - предыдущий пресет
-- `GET /api/presets/favorites` - избранные пресеты
-- `GET /api/presets/recent` - недавние пресеты
-- `GET /api/presets/rack` - rack chain текущего пресета
-- `GET /api/presets/parameters` - параметры текущего пресета
-
-### Плеер
-- `GET /api/player/status` - статус плеера
-- `POST /api/player/play` - воспроизвести трек
-- `POST /api/player/stop` - остановить
-- `POST /api/player/pause` - пауза
-- `POST /api/player/resume` - продолжить
-- `POST /api/player/next` - следующий трек
-- `POST /api/player/prev` - предыдущий трек
-- `POST /api/player/volume` - громкость
-- `GET /api/player/tracks` - список треков
-
-### Плагин
-- `GET /api/plugin/status` - статус плагина
-- `GET /api/plugin/presets` - все пресеты плагина
-- `GET /api/plugin/current` - текущий пресет
-- `GET /api/plugin/rack` - rack chain
-- `GET /api/plugin/parameters` - параметры
-
-### Система
-- `GET /api/status` - полный статус
-- `GET /api/transport` - транспорт (пресет + трек)
-
-## 🎮 Запуск
-
-```bash
+# Run
 python main.py
 ```
 
-После запуска:
-1. Проверьте вкладку "Пресеты" - список должен загрузиться
-2. Проверьте вкладку "Плеер" - список треков должен загрузиться
-3. Проверьте вкладку "Сеть" - нажмите "Создать WebRTC комнату"
-4. Проверьте API: `http://localhost:5000/api/status`
+## Development
+
+### Adding a New Service
+
+1. Create `services/new_service.py` implementing `IService`
+2. Add factory to `services/__init__.py`
+3. Register in `SERVICE_FACTORIES` and `SERVICE_DEPENDENCIES`
+4. Add to `config.ini` `[services]` section
+
+### Service Interface
+
+```python
+class IService:
+    name: str
+    dependencies: List[str]
+    
+    async def start(self) -> bool: ...
+    async def stop(self) -> None: ...
+    async def healthcheck(self) -> ServiceHealth: ...
+    async def get_status(self) -> Dict[str, Any]: ...
+```
+
+## Patch Notes - v2.0.0 (Complete Reconstruction)
+
+### Architecture
+- ✅ Complete modular service architecture
+- ✅ ServiceManager with dependency resolution
+- ✅ BootstrapManager with phased startup
+- ✅ Config-based service enable/disable
+- ✅ Main thread = GUI only (no heavy imports)
+
+### Audio
+- ✅ Real-time engine with sounddevice ASIO
+- ✅ Pedalboard processor for Guitar Rig 7
+- ✅ Lock-free ring buffers for audio callback
+- ✅ VU meter, peak detection, clipping indicator
+- ✅ 48kHz / 64 block / float32 configuration
+
+### Firebase
+- ✅ REST-based sessions (Spark plan compatible)
+- ✅ Session isolation (rooms/{room_id})
+- ✅ WebRTC signaling support
+- ✅ Reconnection logic with exponential backoff
+
+### QR
+- ✅ Session-based QR (UUID, nonce, pairing token)
+- ✅ Isolated cache per session
+- ✅ Async generation in background thread
+
+### BLE
+- ✅ GATT server with custom services
+- ✅ Pairing characteristic (write + notify)
+- ✅ Room characteristic (read + notify)
+- ✅ Status characteristic (read + notify)
+
+### WebRTC
+- ✅ Lazy aiortc import (10s timeout)
+- ✅ Graceful degradation (DummyWebRTCService)
+- ✅ Offer/answer/ICE candidate handling
+- ✅ Audio track from engine ring buffer
+
+### Presets
+- ✅ Async background scanner
+- ✅ Indexed cache with checksums
+- ✅ Incremental updates
+- ✅ Categories, favorites, recent, search
+
+### Player
+- ✅ Real audio decoding (soundfile)
+- ✅ VU meter with RMS/peak
+- ✅ Waveform caching
+- ✅ Playlist controls
+
+### UI
+- ✅ Service Dashboard with real-time status
+- ✅ Audio Monitor with VU meters
+- ✅ Preset Browser with search/filter
+- ✅ Player with waveform
+- ✅ Settings with service toggles
+- ✅ Logs with category filtering
+
+### Core
+- ✅ Multi-channel logger (BOOT, AUDIO, FIREBASE, etc.)
+- ✅ ConfigLoader with service config
+- ✅ Async utilities (RingBuffer, SnapshotStore, TaskGroup)
+- ✅ Freeze/deadlock detection
+- ✅ Health monitoring
+
+## Requirements
+
+- Python 3.10+
+- Windows 10/11 (ASIO support)
+- ASIO4ALL or native ASIO driver
+- Guitar Rig 7 VST3 installed
+
+## License
+
+MIT License

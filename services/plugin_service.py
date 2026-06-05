@@ -29,12 +29,19 @@ class PluginService:
 
     def initialize(self) -> bool:
         """
-        Инициализация сервиса.
+        Инициализация сервиса (lightweight phase).
+
+        НЕ делает:
+        - get_status() (тяжелая introspection)
+        - get_info() (тяжелая introspection)
+        - get_parameters() (тяжелая introspection)
+        - update_state() с тяжелыми данными
 
         Returns:
             bool: True если успешно
         """
         try:
+            # Lightweight: только создать host
             self.host = VST3Host(self.config, self.logger)
 
             if not self.host.initialize():
@@ -43,18 +50,20 @@ class PluginService:
                     self.logger.log_plugin("VST3 хост не инициализирован", "error")
                 return False
 
-            # Проверяем, что плагин реально загружен
-            status = self.host.get_status()
-            if not status.get('plugin_loaded'):
+            # Lightweight: только проверить флаг, НЕ get_status()
+            # get_status() вызывает тяжелую introspection через pedalboard
+            # Это должно быть lazy, не в boot path
+            if not self.host.is_plugin_loaded():
                 self.state_manager.update_state(plugin_loaded=False)
                 if self.logger:
                     self.logger.log_plugin("VST3 плагин не загружен", "error")
                 return False
 
             self._initialized = True
+            # Lightweight: только флаг, без introspection
             self.state_manager.update_state(plugin_loaded=True)
             if self.logger:
-                self.logger.log_plugin("VST3 плагин загружен", "info")
+                self.logger.log_plugin("VST3 плагин загружен (lightweight)", "info")
 
             return True
 
@@ -64,6 +73,25 @@ class PluginService:
                 self.logger.log_plugin(f"Ошибка инициализации: {e}", "error")
                 self.logger.log_plugin(traceback.format_exc(), "error")
             return False
+
+    def get_detailed_status(self) -> Dict[str, Any]:
+        """
+        Получение детального статуса (lazy, не в boot path).
+
+        Вызывает тяжелую introspection через pedalboard.
+        Должен быть вызван только после GUI загрузки.
+        """
+        try:
+            if not self.host:
+                return {'initialized': False, 'plugin_loaded': False}
+
+            # Тяжелая introspection
+            status = self.host.get_status()
+            status['initialized'] = self._initialized
+            status['current_preset_id'] = self._current_preset_id
+            return status
+        except Exception:
+            return {'initialized': False, 'plugin_loaded': False}
 
     def switch_preset(self, preset_id: int) -> bool:
         """

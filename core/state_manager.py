@@ -1,13 +1,14 @@
 """
 State Manager
 ==============
-Централизованное управление состоянием приложения.
+Централизованное управление состоянием приложения с boot guard.
 """
 
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
+import queue
 
 
 class SystemStateEnum(Enum):
@@ -85,12 +86,22 @@ class SystemState:
 
 
 class StateManager:
-    """Менеджер состояния приложения"""
+    """
+    Менеджер состояния приложения с boot guard и async listeners.
+    
+    АРХИТЕКТУРА:
+    ============
+    1. Boot guard: _booting флаг
+    2. Async listeners: queue-based dispatch
+    3. Lock-free UI updates: listeners не блокируют MainThread
+    """
 
     def __init__(self):
         self.state = SystemState()
-        self.listeners = []
+        self.listeners: List[Callable] = []
         self._lock = threading.Lock()
+        self._booting = False
+        self._listener_queue: queue.Queue = queue.Queue()
 
     def add_listener(self, callback) -> None:
         """Добавление слушателя изменений состояния"""
@@ -103,20 +114,61 @@ class StateManager:
             if callback in self.listeners:
                 self.listeners.remove(callback)
 
+    def _notify_listeners_async(self, state_dict: Dict[str, Any]) -> None:
+        """Асинхронное уведомление всех слушателей через queue."""
+        try:
+            self._listener_queue.put(state_dict, block=False)
+        except queue.Full:
+            pass  # Queue full, skip
+
+    def _process_listener_queue(self) -> None:
+        """Обработка очереди listeners (вызывается в отдельном thread)."""
+        while True:
+            try:
+                state_dict = self._listener_queue.get(timeout=0.1)
+                for callback in self.listeners:
+                    try:
+                        callback(state_dict)
+                    except Exception:
+                        pass
+            except queue.Empty:
+                continue
+            except Exception:
+                break
+
     def notify_listeners(self) -> None:
-        """Уведомление всех слушателей"""
+        """
+        Уведомление всех слушателей (асинхронно).
+        НЕ блокирует MainThread.
+        """
         with self._lock:
             state_dict = self.state.get_state_dict()
-            for callback in self.listeners:
-                try:
-                    callback(state_dict)
-                except Exception:
-                    pass
+            self._notify_listeners_async(state_dict)
 
     def update_state(self, **kwargs) -> None:
-        """Обновление состояния"""
+        """
+        Обновление состояния (с boot guard).
+        
+        Args:
+            **kwargs: Поля состояния для обновления
+        """
         with self._lock:
+            # Boot guard: не уведомляем listeners во время boot
             for key, value in kwargs.items():
                 if hasattr(self.state, key):
                     setattr(self.state, key, value)
-            self.notify_listeners()
+            
+            # Не вызываем notify_listeners() если _booting
+            if not self._booting:
+                state_dict = self.state.get_state_dict()
+                self._notify_listeners_async(state_dict)
+
+    def set_booting(self, booting: bool) -> None:
+        """Установка флага boot mode."""
+        with self._lock:
+            self._booting = booting
+
+    def is_booting(self) -> bool:
+        """Проверка, находится ли система в boot mode."""
+        with self._lock:
+            return self._booting

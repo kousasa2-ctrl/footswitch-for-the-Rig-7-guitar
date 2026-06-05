@@ -1,104 +1,176 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-GR7 Hub - Main Application
-===========================
-Guitar Rig 7 Stage Control Hub - Launcher
-
-Архитектура:
-- main.py: bootstrap + lifecycle management
-- ui/: GUI components
-- services/: backend services
-- api/: REST API
-- vst3/: VST3 host
-- midi/: MIDI routing
-- webrtc/: WebRTC streaming
-- core/: utilities (logger, config, state)
+GR7 Hub - Main Entry Point
+==========================
+Production-grade modular async architecture.
+Main thread = GUI ONLY. All heavy work in background.
 """
 
 import sys
-import threading
+import os
+import asyncio
 import traceback
+from pathlib import Path
 
-# Qt imports
-from PyQt6.QtWidgets import QApplication, QMessageBox
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent))
 
-# Application imports
+# ============================================================
+# STEP 1: Logger init (FIRST - before anything else)
+# ============================================================
 from core.logger import Logger
-from utils.qr_generator import QRGenerator
-from ui.main_window import MainWindow, GR7Style
 
+logger = Logger()
+logger.log_boot("=" * 60)
+logger.log_boot("GR7 Hub Starting...")
+logger.log_boot("=" * 60)
 
-def setup_thread_exception_hook():
-    """Setup exception handling in threads."""
-    def excepthook(args):
-        print(f"[THREAD ERROR] {args.thread}: {args.exc_type}: {args.exc_value}")
-        if args.exc_traceback:
-            traceback.print_exception(args.exc_type, args.exc_value, args.exc_traceback)
+# ============================================================
+# STEP 2: QApplication init
+# ============================================================
+from PyQt6.QtWidgets import QApplication
+from PyQt6.QtCore import Qt, QTimer
 
-    threading.excepthook = excepthook
+# Enable high DPI scaling
+QApplication.setHighDpiScaleFactorRoundingPolicy(
+    Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+)
 
+app = QApplication(sys.argv)
+app.setApplicationName("GR7 Hub")
+app.setApplicationVersion("2.0.0")
+app.setOrganizationName("GR7 Hub")
 
-def main():
-    """
-    Main application entry point.
-    Bootstraps all services and starts the GUI.
-    """
-    # Setup exception hooks
-    setup_thread_exception_hook()
+# ============================================================
+# STEP 3: Show empty UI INSTANTLY
+# ============================================================
+from ui.main_window import MainWindow
 
-    # Initialize Qt Application
-    app = QApplication(sys.argv)
+# Create and show main window immediately
+main_window = MainWindow(logger)
+main_window.show()
 
-    # Initialize logger
-    logger = Logger("GR7Hub")
-    logger.info("=" * 60)
-    logger.info("GR7 Hub - Guitar Rig 7 Stage Control System")
-    logger.info("=" * 60)
+logger.log_boot("UI shown - starting background bootstrap...")
 
-    # Initialize QR generator
-    QRGenerator.initialize(".qr_cache")
-    logger.info("QR Generator initialized")
-
-    # Apply theme
+# ============================================================
+# STEP 4: Background bootstrap
+# ============================================================
+async def run_bootstrap():
+    """Run background bootstrap after UI is shown"""
     try:
-        GR7Style.apply_theme(app)
-        app.setStyleSheet(GR7Style.get_stylesheet())
-        logger.info("Theme applied successfully")
+        # Import bootstrap components
+        from core.config_loader import ConfigLoader
+        from core.service_manager import ServiceManager
+        from core.bootstrap import BootstrapManager, BootstrapPhase, ServiceBootstrapConfig
+        from services import SERVICE_FACTORIES, SERVICE_DEPENDENCIES
+        
+        # Load service config
+        config_loader = ConfigLoader()
+        service_config = config_loader.load_services_config()
+        
+        # Create service manager
+        service_manager = ServiceManager(logger, service_config)
+        
+        # Create bootstrap manager
+        bootstrap = BootstrapManager(logger)
+        
+        # Register services with their factories
+        for name, factory in SERVICE_FACTORIES.items():
+            if service_config.get(name, True):  # Only register if enabled
+                deps = SERVICE_DEPENDENCIES.get(name, [])
+                phase = BootstrapPhase.CORE_SERVICES if name in ('audio', 'player') else BootstrapPhase.EXTENDED_SERVICES
+                critical = name in ('audio',)  # Audio is critical
+                
+                bootstrap.register_service_config(ServiceBootstrapConfig(
+                    name=name,
+                    factory=lambda f=factory: f(config_loader, logger),
+                    dependencies=deps,
+                    timeout=30.0,
+                    critical=critical,
+                    phase=phase,
+                ))
+        
+        # Register phase callbacks for UI updates
+        def on_phase(phase_name):
+            logger.log_boot(f"Bootstrap phase: {phase_name}")
+            # Update UI with phase
+            if hasattr(main_window, 'update_bootstrap_phase'):
+                main_window.update_bootstrap_phase(phase_name)
+        
+        for phase in BootstrapPhase:
+            bootstrap.register_phase_callback(phase, lambda p=phase: on_phase(p.value))
+        
+        # Run bootstrap
+        result = await bootstrap.run_bootstrap(service_manager)
+        
+        # Store service manager in main window
+        main_window.set_service_manager(service_manager)
+        
+        # Update UI with results
+        if hasattr(main_window, 'on_bootstrap_complete'):
+            main_window.on_bootstrap_complete(result)
+        
+        logger.log_boot(f"Bootstrap completed: {result.success}", "success" if result.success else "error")
+        logger.log_boot(f"  Started: {result.started_services}")
+        logger.log_boot(f"  Failed: {result.failed_services}")
+        logger.log_boot(f"  Disabled: {result.disabled_services}")
+        
+        # Start service health monitoring UI updates
+        if hasattr(main_window, 'start_health_monitoring'):
+            main_window.start_health_monitoring(service_manager)
+        
+        return service_manager
+        
     except Exception as e:
-        logger.error(f"Failed to apply theme: {e}")
+        logger.log_boot(f"Bootstrap failed: {e}", "error")
+        logger.log_boot(traceback.format_exc(), "error")
+        if hasattr(main_window, 'on_bootstrap_error'):
+            main_window.on_bootstrap_error(str(e))
+        return None
 
-    # Create and show main window
-    try:
-        window = MainWindow()
-        window.show()
-        logger.info("Main window created and shown")
-    except Exception as e:
-        logger.error(f"Failed to create main window: {e}")
-        traceback.print_exc()
-        msg = QMessageBox()
-        msg.setIcon(QMessageBox.Icon.Critical)
-        msg.setText("Ошибка запуска приложения")
-        msg.setDetailedText(f"{e}\n\n{traceback.format_exc()}")
-        msg.setWindowTitle("GR7 Hub Error")
-        msg.exec()
-        return 1
 
-    # Run application
-    logger.info("Starting event loop...")
+def start_background_bootstrap():
+    """Start bootstrap in asyncio event loop"""
+    # Create new event loop for background tasks
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Run bootstrap
+    service_manager = loop.run_until_complete(run_bootstrap())
+    
+    # Keep loop running for health monitoring
+    if service_manager:
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            loop.run_until_complete(service_manager.stop_all())
+            loop.close()
+
+
+# Start bootstrap in background thread
+import threading
+bootstrap_thread = threading.Thread(
+    target=start_background_bootstrap,
+    daemon=True,
+    name="BootstrapThread"
+)
+bootstrap_thread.start()
+
+# ============================================================
+# Run Qt event loop (MAIN THREAD)
+# ============================================================
+logger.log_boot("Entering Qt main loop")
+
+try:
     exit_code = app.exec()
-
-    # Cleanup
-    logger.info("Shutting down services...")
-    try:
-        if hasattr(window, 'closeEvent'):
-            window.closeEvent(None)
-    except Exception as e:
-        logger.error(f"Error during cleanup: {e}")
-
-    logger.info("GR7 Hub closed successfully")
-    return exit_code
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    logger.log_boot(f"Application exiting with code {exit_code}", "info")
+    sys.exit(exit_code)
+except KeyboardInterrupt:
+    logger.log_boot("Keyboard interrupt", "warning")
+    sys.exit(0)
+except Exception as e:
+    logger.log_boot(f"Fatal error: {e}", "critical")
+    logger.log_boot(traceback.format_exc(), "critical")
+    sys.exit(1)

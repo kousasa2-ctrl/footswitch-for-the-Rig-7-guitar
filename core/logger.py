@@ -1,18 +1,20 @@
 """
 Logger
 ======
-Честное логирование без ложных SUCCESS сообщений.
+Полноценная система диагностики с thread-safe логированием, traceback и детальной информацией.
 """
 
 import logging
 import sys
 import traceback
+import threading
 from typing import Optional, Callable
 from datetime import datetime
+from contextlib import contextmanager
 
 
 class Logger:
-    """Модуль логирования"""
+    """Модуль логирования с детальной информацией о трассировке и потоках"""
 
     def __init__(self, name: str = "GR7Hub", log_file: Optional[str] = None):
         self.name = name
@@ -20,18 +22,18 @@ class Logger:
         self._setup_logger()
 
     def _setup_logger(self) -> None:
-        """Настройка логгера"""
+        """Настройка логгера с детальным форматированием"""
         self.logger = logging.getLogger(self.name)
         self.logger.setLevel(logging.DEBUG)
 
         # Очистка существующих handlers
         self.logger.handlers.clear()
 
-        # Console handler
+        # Console handler с детальным форматом
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(logging.DEBUG)
         console_format = logging.Formatter(
-            '[%(levelname)s] %(message)s',
+            '[%(asctime)s.%(msecs)03d] [%(threadName)s] [%(levelname)s] [%(name)s] %(message)s',
             datefmt='%H:%M:%S'
         )
         console_handler.setFormatter(console_format)
@@ -42,8 +44,8 @@ class Logger:
             file_handler = logging.FileHandler(self.log_file, encoding='utf-8')
             file_handler.setLevel(logging.DEBUG)
             file_format = logging.Formatter(
-                '%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-                datefmt='%Y-%m-d %H:%M:%S'
+                '%(asctime)s [%(threadName)s] [%(levelname)s] [%(name)s] %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
             )
             file_handler.setFormatter(file_format)
             self.logger.addHandler(file_handler)
@@ -189,3 +191,57 @@ class Logger:
             self.info(f"{prefix} {message}")
         else:
             self.info(f"{prefix} {message}")
+
+    def log_boot(self, message: str) -> None:
+        """Логирование этапов загрузки"""
+        self.info(f"[BOOT] {message}")
+
+    def log_thread(self, message: str, level: str = "info") -> None:
+        """Логирование событий потоков"""
+        prefix = "[THREAD]"
+        if level == "error":
+            self.error(f"{prefix} {message}")
+        else:
+            self.info(f"{prefix} {message}")
+
+    def log_system(self, message: str, level: str = "info") -> None:
+        """Логирование системных событий"""
+        prefix = "[SYSTEM]"
+        if level == "error":
+            self.error(f"{prefix} {message}")
+        else:
+            self.info(f"{prefix} {message}")
+
+    def log_import(self, module_name: str, duration: float) -> None:
+        """Логирование времени импорта модуля"""
+        if duration > 2.0:
+            self.warning(f"[IMPORT] {module_name} loaded in {duration:.2f}s (SLOW IMPORT DETECTED)")
+        else:
+            self.info(f"[IMPORT] {module_name} loaded in {duration:.2f}s")
+
+    def log_service(self, service_name: str, message: str, status: str = "info") -> None:
+        """Логирование событий сервиса"""
+        prefix = f"[SERVICE:{service_name}]"
+        if status == "error":
+            self.error(f"{prefix} {message}")
+        elif status == "success":
+            self.info(f"{prefix} {message}")
+        else:
+            self.info(f"{prefix} {message}")
+
+    def log_exception(self, exc_type, exc_value, exc_traceback) -> None:
+        """Логирование исключения с детальной информацией"""
+        thread_name = threading.current_thread().name
+        filename = exc_traceback.tb_frame.f_code.co_filename
+        lineno = exc_traceback.tb_lineno
+        func_name = exc_traceback.tb_frame.f_code.co_name
+
+        self.error(f"\n{'='*60}")
+        self.error(f"[EXCEPTION] Thread: {thread_name}")
+        self.error(f"[EXCEPTION] File: {filename}:{lineno} in {func_name}")
+        self.error(f"[EXCEPTION] Type: {exc_type.__name__}")
+        self.error(f"[EXCEPTION] Value: {exc_value}")
+        self.error(f"{'='*60}\n")
+
+        # Печать traceback
+        traceback.print_exception(exc_type, exc_value, exc_traceback)

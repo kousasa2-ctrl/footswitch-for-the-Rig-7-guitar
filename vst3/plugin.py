@@ -136,21 +136,46 @@ class VST3Plugin:
             return {}
 
         try:
+            # Сначала пытаемся получить параметры через атрибут 'parameters'
+            if hasattr(self._plugin, 'parameters'):
+                try:
+                    params_obj = self._plugin.parameters
+                    # Если это словарь или dict-like объект
+                    if isinstance(params_obj, dict):
+                        return params_obj
+                    # Если это итерируемый объект с ключами
+                    if hasattr(params_obj, 'keys'):
+                        return {k: float(params_obj[k]) for k in params_obj.keys()}
+                except Exception as e:
+                    if self.logger:
+                        self.logger.log_vst(f"Предупреждение при доступе к parameters: {e}", "warning")
+            
+            # Fallback: безопасно итерируем по атрибутам
             params = {}
-            for attr in dir(self._plugin):
+            try:
+                # Получаем список атрибутов безопасно
+                attrs = dir(self._plugin)
+            except Exception as e:
+                if self.logger:
+                    self.logger.log_vst(f"Не удалось получить список атрибутов: {e}", "warning")
+                return {}
+
+            for attr in attrs:
+                # Пропускаем приватные атрибуты
                 if attr.startswith('_'):
                     continue
 
                 try:
                     value = getattr(self._plugin, attr)
+                    # Проверяем, является ли значение числом
+                    if isinstance(value, (int, float)):
+                        try:
+                            params[attr] = float(value)
+                        except (ValueError, TypeError):
+                            continue
                 except Exception:
+                    # Пропускаем атрибуты, которые вызывают ошибку при доступе
                     continue
-
-                if isinstance(value, (int, float)):
-                    try:
-                        params[attr] = float(value)
-                    except Exception:
-                        continue
 
             return params
         except Exception as e:

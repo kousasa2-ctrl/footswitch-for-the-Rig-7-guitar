@@ -1,0 +1,12 @@
+{
+  "audio": true,
+  "firebase": false,
+  "webrtc": false,
+  "ble": false,
+  "api_server": true,
+  "qr": true,
+  "midi": false,
+  "preset_scan": true,
+  "player": true,
+  "vst3": true
+}

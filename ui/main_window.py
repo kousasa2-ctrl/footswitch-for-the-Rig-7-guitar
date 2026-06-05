@@ -1,26 +1,39 @@
-import threading
+#!/usr/bin/env python3
+"""
+GR7 Hub - Main Window
+=====================
+Modern UI with service dashboard, realtime audio monitoring,
+and modular service integration.
+"""
+
 import sys
+import threading
+import time
+from pathlib import Path
+from typing import Dict, Any, Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QLabel, QPushButton, QFrame, QProgressBar, QTextEdit,
     QGroupBox, QGridLayout, QComboBox, QSlider, QListWidget, QListWidgetItem,
-    QSplitter
+    QSplitter, QPlainTextEdit, QCheckBox, QLineEdit, QScrollArea
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt6.QtGui import QColor, QPalette, QTextCursor
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, pyqtSlot
+from PyQt6.QtGui import QColor, QPalette, QTextCursor, QFont, QPixmap
 
-from core import StateManager, ConfigLoader, Logger
-from services import (
-    PluginService, AudioService, MIDIService,
-    WebRTCService, PlayerService, PresetCatalog
-)
-from api.server import APIServer
-from utils.qr_generator import QRGenerator
+from core import Logger, ServiceManager, ServiceState, ServiceHealth
+from services import SERVICE_FACTORIES, SERVICE_DEPENDENCIES
 
 
 class GUISignals(QObject):
+    """Thread-safe signals for GUI updates"""
     log_signal = pyqtSignal(str, str)
+    service_status_signal = pyqtSignal(str, dict)
+    bootstrap_phase_signal = pyqtSignal(str)
+    bootstrap_complete_signal = pyqtSignal(dict)
+    bootstrap_error_signal = pyqtSignal(str)
+    vu_meter_signal = pyqtSignal(dict)
+    waveform_signal = pyqtSignal(dict)
 
 
 class GR7Style:
@@ -131,7 +144,7 @@ class GR7Style:
                 left: 10px;
             }
 
-            QTextEdit {
+            QTextEdit, QPlainTextEdit {
                 background-color: #0F0F0F;
                 border: 1px solid #252525;
                 color: #A0A0A0;
@@ -188,625 +201,968 @@ class GR7Style:
                 background: #FF9D00;
                 border: 1px solid #FFAA22;
             }
+
+            QProgressBar {
+                border: 1px solid #2D2D2D;
+                border-radius: 2px;
+                background-color: #121212;
+                text-align: center;
+                color: #E0E0E0;
+            }
+
+            QProgressBar::chunk {
+                background-color: #FF9D00;
+                border-radius: 1px;
+            }
         """
 
 
-class PresetBrowserTab(QWidget):
-    """Вкладка браузера пресетов"""
+class ServiceDashboardTab(QWidget):
+    """Service dashboard showing all service statuses"""
+    
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.service_widgets = {}
+        self.init_ui()
+        
+        # Update timer
+        self.update_timer = QTimer()
+        self.update_timer.setInterval(1000)
+        self.update_timer.timeout.connect(self.update_all_services)
+        self.update_timer.start()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header
+        header = QHBoxLayout()
+        title = QLabel("SERVICE DASHBOARD")
+        title.setStyleSheet("font-size: 14px; font-weight: bold; color: #FF9D00;")
+        header.addWidget(title)
+        header.addStretch()
+        
+        self.btn_refresh = QPushButton("Refresh")
+        self.btn_refresh.clicked.connect(self.update_all_services)
+        header.addWidget(self.btn_refresh)
+        
+        layout.addLayout(header)
+        
+        # Scroll area for services
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        
+        self.services_container = QWidget()
+        self.services_layout = QVBoxLayout(self.services_container)
+        self.services_layout.setContentsMargins(0, 0, 0, 0)
+        self.services_layout.setSpacing(10)
+        
+        scroll.setWidget(self.services_container)
+        layout.addWidget(scroll)
+        
+        # Create service widgets
+        self.create_service_widgets()
+    
+    def create_service_widgets(self):
+        """Create widgets for each service"""
+        services = [
+            ('audio', 'Audio Engine', '🎵'),
+            ('player', 'Backing Track Player', '🎧'),
+            ('firebase', 'Firebase', '☁️'),
+            ('qr', 'QR Generator', '📱'),
+            ('ble', 'Bluetooth LE', '📶'),
+            ('webrtc', 'WebRTC', '🌐'),
+            ('preset_scan', 'Preset Catalog', '📚'),
+            ('api_server', 'API Server', '🔌'),
+        ]
+        
+        for name, display_name, icon in services:
+            widget = self.create_service_widget(name, display_name, icon)
+            self.service_widgets[name] = widget
+            self.services_layout.addWidget(widget)
+        
+        self.services_layout.addStretch()
+    
+    def create_service_widget(self, name: str, display_name: str, icon: str) -> QGroupBox:
+        """Create a service status widget"""
+        group = QGroupBox(f"{icon} {display_name}")
+        group.setObjectName(f"service_{name}")
+        layout = QGridLayout(group)
+        
+        # Status indicator
+        status_label = QLabel("●")
+        status_label.setObjectName("status_indicator")
+        status_label.setStyleSheet("font-size: 16px; color: #555555;")
+        layout.addWidget(QLabel("Status:"), 0, 0)
+        layout.addWidget(status_label, 0, 1)
+        
+        # State text
+        state_label = QLabel("Unknown")
+        state_label.setObjectName("state_label")
+        state_label.setStyleSheet("color: #888888;")
+        layout.addWidget(state_label, 0, 2)
+        
+        # Health
+        health_label = QLabel("Health: Unknown")
+        health_label.setObjectName("health_label")
+        health_label.setStyleSheet("color: #888888;")
+        layout.addWidget(health_label, 1, 0, 1, 3)
+        
+        # Details
+        details_label = QLabel("")
+        details_label.setObjectName("details_label")
+        details_label.setStyleSheet("color: #666666; font-size: 10px;")
+        details_label.setWordWrap(True)
+        layout.addWidget(details_label, 2, 0, 1, 3)
+        
+        # Progress bar for loading
+        progress = QProgressBar()
+        progress.setObjectName("progress_bar")
+        progress.setVisible(False)
+        progress.setRange(0, 0)  # Indeterminate
+        layout.addWidget(progress, 3, 0, 1, 3)
+        
+        # Store references
+        group.status_label = status_label
+        group.state_label = state_label
+        group.health_label = health_label
+        group.details_label = details_label
+        group.progress = progress
+        
+        return group
+    
+    def update_service_widget(self, name: str, status: Dict[str, Any]):
+        """Update a service widget with status"""
+        widget = self.service_widgets.get(name)
+        if not widget:
+            return
+        
+        state = status.get('state', 'unknown')
+        health = status.get('health', 'unknown')
+        error = status.get('error')
+        enabled = status.get('enabled', True)
+        
+        # Update state
+        widget.state_label.setText(f"State: {state.upper()}")
+        
+        # Update status indicator color
+        if state == 'running':
+            widget.status_label.setStyleSheet("font-size: 16px; color: #33FF33;")
+        elif state == 'degraded':
+            widget.status_label.setStyleSheet("font-size: 16px; color: #FF9D00;")
+        elif state == 'failed':
+            widget.status_label.setStyleSheet("font-size: 16px; color: #FF3333;")
+        elif state == 'disabled':
+            widget.status_label.setStyleSheet("font-size: 16px; color: #555555;")
+        elif state == 'starting':
+            widget.status_label.setStyleSheet("font-size: 16px; color: #FF9D00;")
+        else:
+            widget.status_label.setStyleSheet("font-size: 16px; color: #555555;")
+        
+        # Update health
+        if health == 'healthy':
+            widget.health_label.setText("Health: ✓ Healthy")
+            widget.health_label.setStyleSheet("color: #33FF33;")
+        elif health == 'degraded':
+            widget.health_label.setText("Health: ⚠ Degraded")
+            widget.health_label.setStyleSheet("color: #FF9D00;")
+        elif health == 'unhealthy':
+            widget.health_label.setText("Health: ✗ Unhealthy")
+            widget.health_label.setStyleSheet("color: #FF3333;")
+        else:
+            widget.health_label.setText("Health: ? Unknown")
+            widget.health_label.setStyleSheet("color: #888888;")
+        
+        # Update details
+        details = []
+        if error:
+            details.append(f"Error: {error}")
+        if 'uptime' in status:
+            uptime = status['uptime']
+            if uptime > 0:
+                details.append(f"Uptime: {uptime:.1f}s")
+        if 'cpu_load' in status:
+            details.append(f"CPU: {status['cpu_load']:.1f}%")
+        if 'buffer_underruns' in status:
+            details.append(f"Underruns: {status['buffer_underruns']}")
+        
+        widget.details_label.setText(" | ".join(details) if details else "No details")
+        
+        # Show/hide progress for starting state
+        widget.progress.setVisible(state == 'starting')
+    
+    def update_all_services(self):
+        """Update all service widgets"""
+        if not self.main_window.service_manager:
+            return
+        
+        try:
+            statuses = self.main_window.service_manager.get_all_status()
+            for name, status in statuses.items():
+                self.update_service_widget(name, status)
+        except Exception as e:
+            self.main_window.log(f"Dashboard update error: {e}", "error")
 
+
+class AudioMonitorTab(QWidget):
+    """Real-time audio monitoring with VU meters and waveform"""
+    
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
         self.init_ui()
+        
+        # Update timer
+        self.update_timer = QTimer()
+        self.update_timer.setInterval(50)  # 20 FPS
+        self.update_timer.timeout.connect(self.update_audio)
+        self.update_timer.start()
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(15)
+        
+        # VU Meters
+        vu_group = QGroupBox("VU METERS")
+        vu_layout = QHBoxLayout(vu_group)
+        
+        # Left channel
+        left_layout = QVBoxLayout()
+        left_layout.addWidget(QLabel("LEFT"))
+        self.vu_left = QProgressBar()
+        self.vu_left.setOrientation(Qt.Orientation.Vertical)
+        self.vu_left.setRange(0, 100)
+        self.vu_left.setFixedWidth(60)
+        self.vu_left.setStyleSheet("""
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #33FF33, stop:0.7 #FF9D00, stop:1 #FF3333);
+            }
+        """)
+        left_layout.addWidget(self.vu_left)
+        self.vu_left_label = QLabel("-∞ dB")
+        self.vu_left_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        left_layout.addWidget(self.vu_left_label)
+        vu_layout.addLayout(left_layout)
+        
+        # Right channel
+        right_layout = QVBoxLayout()
+        right_layout.addWidget(QLabel("RIGHT"))
+        self.vu_right = QProgressBar()
+        self.vu_right.setOrientation(Qt.Orientation.Vertical)
+        self.vu_right.setRange(0, 100)
+        self.vu_right.setFixedWidth(60)
+        self.vu_right.setStyleSheet("""
+            QProgressBar::chunk {
+                background-color: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 #33FF33, stop:0.7 #FF9D00, stop:1 #FF3333);
+            }
+        """)
+        right_layout.addWidget(self.vu_right)
+        self.vu_right_label = QLabel("-∞ dB")
+        self.vu_right_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        right_layout.addWidget(self.vu_right_label)
+        vu_layout.addLayout(right_layout)
+        
+        # Peak indicators
+        peak_layout = QVBoxLayout()
+        peak_layout.addWidget(QLabel("PEAKS"))
+        self.peak_left_label = QLabel("L: -∞ dB")
+        self.peak_right_label = QLabel("R: -∞ dB")
+        self.clip_label = QLabel("CLIP: No")
+        self.clip_label.setStyleSheet("color: #33FF33; font-weight: bold;")
+        peak_layout.addWidget(self.peak_left_label)
+        peak_layout.addWidget(self.peak_right_label)
+        peak_layout.addWidget(self.clip_label)
+        vu_layout.addLayout(peak_layout)
+        
+        vu_layout.addStretch()
+        layout.addWidget(vu_group)
+        
+        # Waveform
+        wave_group = QGroupBox("WAVEFORM")
+        wave_layout = QVBoxLayout(wave_group)
+        
+        self.waveform_canvas = QLabel()
+        self.waveform_canvas.setMinimumHeight(150)
+        self.waveform_canvas.setStyleSheet("background-color: #0F0F0F; border: 1px solid #252525;")
+        self.waveform_canvas.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        wave_layout.addWidget(self.waveform_canvas)
+        
+        layout.addWidget(wave_group)
+        
+        # Audio info
+        info_group = QGroupBox("AUDIO INFO")
+        info_layout = QGridLayout(info_group)
+        
+        self.info_labels = {}
+        info_items = [
+            ('sample_rate', 'Sample Rate:', '0 Hz'),
+            ('block_size', 'Block Size:', '0'),
+            ('latency', 'Latency:', '0 ms'),
+            ('cpu_load', 'CPU Load:', '0%'),
+            ('underruns', 'Underruns:', '0'),
+            ('overruns', 'Overruns:', '0'),
+        ]
+        
+        for i, (key, label, default) in enumerate(info_items):
+            info_layout.addWidget(QLabel(label), i // 3, (i % 3) * 2)
+            value_label = QLabel(default)
+            value_label.setStyleSheet("color: #FF9D00; font-weight: bold;")
+            info_layout.addWidget(value_label, i // 3, (i % 3) * 2 + 1)
+            self.info_labels[key] = value_label
+        
+        layout.addWidget(info_group)
+        layout.addStretch()
+    
+    def update_audio(self):
+        """Update audio monitoring from audio service"""
+        if not self.main_window.service_manager:
+            return
+        
+        try:
+            if not self.main_window.service_manager.is_running('audio'):
+                return
+            
+            # Get audio service status
+            status = self.main_window.service_manager.get_service_status('audio')
+            if not status:
+                return
+            
+            details = status.get('details', {})
+            engine = details.get('engine', {})
+            vu = details.get('vu_meter', {})
+            waveform = details.get('waveform', {})
+            
+            # Update VU meters
+            left = vu.get('left', 0.0)
+            right = vu.get('right', 0.0)
+            peak_left = vu.get('peak_left', 0.0)
+            peak_right = vu.get('peak_right', 0.0)
+            clipping = vu.get('clipping', False)
+            
+            # Convert to dB and percentage
+            def to_db(linear):
+                if linear <= 0:
+                    return -120
+                return 20 * (linear).bit_length() - 20  # Approximate
+            
+            def to_percent(linear):
+                return min(100, int(linear * 100))
+            
+            self.vu_left.setValue(to_percent(left))
+            self.vu_right.setValue(to_percent(right))
+            
+            self.vu_left_label.setText(f"{to_db(left):.1f} dB")
+            self.vu_right_label.setText(f"{to_db(right):.1f} dB")
+            
+            self.peak_left_label.setText(f"L: {to_db(peak_left):.1f} dB")
+            self.peak_right_label.setText(f"R: {to_db(peak_right):.1f} dB")
+            
+            if clipping:
+                self.clip_label.setText("CLIP: YES!")
+                self.clip_label.setStyleSheet("color: #FF3333; font-weight: bold;")
+            else:
+                self.clip_label.setText("CLIP: No")
+                self.clip_label.setStyleSheet("color: #33FF33; font-weight: bold;")
+            
+            # Update waveform
+            if waveform.get('left') and waveform.get('right'):
+                self.draw_waveform(waveform['left'], waveform['right'])
+            
+            # Update info
+            self.info_labels['sample_rate'].setText(f"{engine.get('sample_rate', 0)} Hz")
+            self.info_labels['block_size'].setText(str(engine.get('block_size', 0)))
+            self.info_labels['latency'].setText(f"{engine.get('callback_time_ms', 0):.2f} ms")
+            self.info_labels['cpu_load'].setText(f"{engine.get('cpu_load', 0):.1f}%")
+            self.info_labels['underruns'].setText(str(engine.get('buffer_underruns', 0)))
+            self.info_labels['overruns'].setText(str(engine.get('buffer_overruns', 0)))
+            
+        except Exception as e:
+            self.main_window.log(f"Audio monitor error: {e}", "error")
+    
+    def draw_waveform(self, left_data, right_data):
+        """Draw waveform on canvas"""
+        # Simple text-based waveform for now
+        # In production, use QPainter for actual waveform drawing
+        width = 80
+        left_str = ""
+        right_str = ""
+        
+        for i in range(min(width, len(left_data))):
+            val = abs(left_data[i]) if i < len(left_data) else 0
+            bar = int(val * 10)
+            left_str += "█" * min(bar, 5) + " " * (5 - min(bar, 5))
+        
+        for i in range(min(width, len(right_data))):
+            val = abs(right_data[i]) if i < len(right_data) else 0
+            bar = int(val * 10)
+            right_str += "█" * min(bar, 5) + " " * (5 - min(bar, 5))
+        
+        self.waveform_canvas.setText(f"L: {left_str}\nR: {right_str}")
+        self.waveform_canvas.setFont(QFont("Consolas", 8))
 
+
+class PresetBrowserTab(QWidget):
+    """Preset browser with search and categories"""
+    
+    def __init__(self, main_window):
+        super().__init__()
+        self.main_window = main_window
+        self.init_ui()
+    
     def init_ui(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-
+        
         splitter = QSplitter(Qt.Orientation.Horizontal)
-
+        
+        # Left panel - preset list
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
-
-        search_box = QGroupBox("Поиск пресетов")
+        
+        search_box = QGroupBox("Search Presets")
         search_layout = QVBoxLayout(search_box)
-        self.search_input = QTextEdit()
-        self.search_input.setMaximumHeight(30)
-        self.search_input.setPlaceholderText("Введите имя пресета...")
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search presets...")
+        self.search_input.textChanged.connect(self.filter_presets)
         search_layout.addWidget(self.search_input)
         left_layout.addWidget(search_box)
-
-        presets_box = QGroupBox("Доступные пресеты")
+        
+        # Category filter
+        cat_box = QGroupBox("Category")
+        cat_layout = QVBoxLayout(cat_box)
+        self.category_combo = QComboBox()
+        self.category_combo.addItem("All Categories")
+        self.category_combo.currentTextChanged.connect(self.filter_presets)
+        cat_layout.addWidget(self.category_combo)
+        left_layout.addWidget(cat_box)
+        
+        presets_box = QGroupBox("Presets")
         presets_layout = QVBoxLayout(presets_box)
         self.preset_list = QListWidget()
-        self.preset_list.itemSelectionChanged.connect(self._on_preset_selected)
+        self.preset_list.itemSelectionChanged.connect(self.on_preset_selected)
         presets_layout.addWidget(self.preset_list)
         left_layout.addWidget(presets_box)
-
+        
+        # Right panel - preset details
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-
-        info_box = QGroupBox("Информация о пресете")
+        
+        info_box = QGroupBox("Preset Info")
         info_layout = QGridLayout(info_box)
-        info_layout.addWidget(QLabel("Название:"), 0, 0)
+        info_layout.addWidget(QLabel("Name:"), 0, 0)
         self.lbl_name = QLabel("-")
         self.lbl_name.setStyleSheet("color: #FF9D00; font-weight: bold;")
         info_layout.addWidget(self.lbl_name, 0, 1)
-
-        info_layout.addWidget(QLabel("Категория:"), 1, 0)
+        
+        info_layout.addWidget(QLabel("Category:"), 1, 0)
         self.lbl_category = QLabel("-")
         info_layout.addWidget(self.lbl_category, 1, 1)
-
-        info_layout.addWidget(QLabel("Компоненты:"), 2, 0)
+        
+        info_layout.addWidget(QLabel("Components:"), 2, 0)
         self.lbl_components = QLabel("-")
         info_layout.addWidget(self.lbl_components, 2, 1)
         right_layout.addWidget(info_box)
-
-        rack_box = QGroupBox("Текущая стойка эффектов (Rack Chain)")
+        
+        rack_box = QGroupBox("Rack Chain")
         rack_layout = QVBoxLayout(rack_box)
         self.rack_list = QListWidget()
         rack_layout.addWidget(self.rack_list)
-
+        
         btn_layout = QHBoxLayout()
-        self.btn_load = QPushButton("Загрузить в Guitar Rig")
+        self.btn_load = QPushButton("Load Preset")
         self.btn_load.setObjectName("accent-btn")
-        self.btn_load.clicked.connect(self._on_load_clicked)
+        self.btn_load.clicked.connect(self.on_load_clicked)
         btn_layout.addWidget(self.btn_load)
         rack_layout.addLayout(btn_layout)
-
+        
         right_layout.addWidget(rack_box)
-
+        
+        # Favorites
+        fav_box = QGroupBox("Favorites")
+        fav_layout = QVBoxLayout(fav_box)
+        self.fav_list = QListWidget()
+        fav_layout.addWidget(self.fav_list)
+        right_layout.addWidget(fav_box)
+        
         splitter.addWidget(left_panel)
         splitter.addWidget(right_panel)
         splitter.setSizes([450, 750])
-
+        
         layout.addWidget(splitter)
-
+    
     def update_presets(self):
-        self.preset_list.clear()
-        presets = self.main_window.preset_catalog.get_all_presets()
-        for p in presets:
-            item = QListWidgetItem(p.get('name', 'Без названия'))
-            item.setData(Qt.ItemDataRole.UserRole, p)
-            self.preset_list.addItem(item)
-
-    def _on_preset_selected(self):
+        """Update preset list from catalog service"""
+        if not self.main_window.service_manager:
+            return
+        
+        try:
+            if not self.main_window.service_manager.is_running('preset_scan'):
+                return
+            
+            status = self.main_window.service_manager.get_service_status('preset_scan')
+            if not status:
+                return
+            
+            details = status.get('details', {})
+            categories = details.get('categories', {})
+            
+            # Update category combo
+            current = self.category_combo.currentText()
+            self.category_combo.clear()
+            self.category_combo.addItem("All Categories")
+            for cat in sorted(categories.keys()):
+                self.category_combo.addItem(cat)
+            if current in [self.category_combo.itemText(i) for i in range(self.category_combo.count())]:
+                self.category_combo.setCurrentText(current)
+            
+            # Update preset list
+            self.filter_presets()
+            
+        except Exception as e:
+            self.main_window.log(f"Preset update error: {e}", "error")
+    
+    def filter_presets(self):
+        """Filter preset list"""
+        if not self.main_window.service_manager:
+            return
+        
+        try:
+            search = self.search_input.text().lower()
+            category = self.category_combo.currentText()
+            
+            status = self.main_window.service_manager.get_service_status('preset_scan')
+            if not status:
+                return
+            
+            details = status.get('details', {})
+            # Get presets from service
+            # For now, just show placeholder
+            self.preset_list.clear()
+            self.preset_list.addItem("Preset loading from service...")
+            
+        except Exception as e:
+            self.main_window.log(f"Filter presets error: {e}", "error")
+    
+    def on_preset_selected(self):
         selected = self.preset_list.selectedItems()
         if not selected:
             return
-        preset_data = selected[0].data(Qt.ItemDataRole.UserRole)
-
-        self.lbl_name.setText(preset_data.get('name', '-'))
-        self.lbl_category.setText(preset_data.get('category', 'Общая'))
-
-        components = preset_data.get('components', [])
-        self.lbl_components.setText(f"{len(components)} шт.")
-
-        self.rack_list.clear()
-        for comp in components:
-            self.rack_list.addItem(f" [{comp.get('type', 'FX')}] {comp.get('name', 'Unknown')}")
-
-    def _on_load_clicked(self):
+        # Update details
+        self.lbl_name.setText(selected[0].text())
+    
+    def on_load_clicked(self):
         selected = self.preset_list.selectedItems()
         if not selected:
             return
-        preset_data = selected[0].data(Qt.ItemDataRole.UserRole)
-        preset_id = preset_data.get('id')
-
-        self.main_window.log(f"Запрос на загрузку пресета: {preset_data.get('name')}", "info")
-        success = self.main_window.plugin_service.switch_preset_by_id(preset_id)
-        if success:
-            self.main_window.log(
-                f"Пресет {preset_data.get('name')} успешно загружен!", "success"
-            )
-            self.main_window.state_manager.update_state(current_preset=preset_data.get('name'))
-        else:
-            self.main_window.log(
-                f"Не удалось загрузить пресет {preset_data.get('name')}", "error"
-            )
-
-    def _update_rack_chain(self):
-        if not self.main_window.plugin_service:
-            return
-        if self.main_window.plugin_service.get_status().get('plugin_loaded'):
-            current = self.main_window.plugin_service.get_current_preset_info()
-            if current:
-                self.lbl_name.setText(current.get('name', '-'))
-                self.lbl_category.setText(current.get('category', 'Общая'))
+        self.main_window.log(f"Load preset: {selected[0].text()}", "info")
 
 
-class AudioPlayerTab(QWidget):
-    """Вкладка медиаплеера фонограмм"""
-
+class PlayerTab(QWidget):
+    """Backing track player"""
+    
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
         self.init_ui()
-
-        self.track_timer = QTimer()
-        self.track_timer.setInterval(500)
-        self.track_timer.timeout.connect(self._update_playback_progress)
-        self.track_timer.start()
-
+        
+        self.update_timer = QTimer()
+        self.update_timer.setInterval(500)
+        self.update_timer.timeout.connect(self.update_player)
+        self.update_timer.start()
+    
     def init_ui(self):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-
+        
         splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        left_box = QGroupBox("Плейлист минусовок (Backing Tracks)")
+        
+        # Playlist
+        left_box = QGroupBox("Playlist")
         left_layout = QVBoxLayout(left_box)
         self.track_list = QListWidget()
-        self.track_list.itemDoubleClicked.connect(self._on_track_double_clicked)
+        self.track_list.itemDoubleClicked.connect(self.on_track_double_clicked)
         left_layout.addWidget(self.track_list)
         splitter.addWidget(left_box)
-
+        
+        # Controls
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
         right_layout.setContentsMargins(0, 0, 0, 0)
-
-        control_box = QGroupBox("Управление воспроизведением")
+        
+        control_box = QGroupBox("Playback Control")
         control_layout = QVBoxLayout(control_box)
-
-        self.lbl_current_track = QLabel("Трек не выбран")
+        
+        self.lbl_current_track = QLabel("No track selected")
         self.lbl_current_track.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.lbl_current_track.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #FF9D00; padding: 10px;"
-        )
+        self.lbl_current_track.setStyleSheet("font-size: 14px; font-weight: bold; color: #FF9D00; padding: 10px;")
         control_layout.addWidget(self.lbl_current_track)
-
+        
         progress_layout = QHBoxLayout()
         self.lbl_time_cur = QLabel("00:00")
         self.slider_progress = QSlider(Qt.Orientation.Horizontal)
-        self.slider_progress.sliderMoved.connect(self._on_slider_moved)
+        self.slider_progress.sliderMoved.connect(self.on_slider_moved)
         self.lbl_time_total = QLabel("00:00")
         progress_layout.addWidget(self.lbl_time_cur)
         progress_layout.addWidget(self.slider_progress)
         progress_layout.addWidget(self.lbl_time_total)
         control_layout.addLayout(progress_layout)
-
+        
         btn_layout = QHBoxLayout()
-        self.btn_prev = QPushButton("⏮ Пред")
-        self.btn_prev.clicked.connect(self._on_prev_clicked)
-        self.btn_play = QPushButton("▶ ИГРАТЬ")
+        self.btn_prev = QPushButton("⏮ Prev")
+        self.btn_prev.clicked.connect(self.on_prev_clicked)
+        self.btn_play = QPushButton("▶ PLAY")
         self.btn_play.setStyleSheet("font-weight: bold; font-size: 12px;")
-        self.btn_play.clicked.connect(self._on_play_clicked)
-        self.btn_pause = QPushButton("⏸ ПАУЗА")
-        self.btn_pause.clicked.connect(self._on_pause_clicked)
-        self.btn_next = QPushButton("⏭ След")
-        self.btn_next.clicked.connect(self._on_next_clicked)
-
+        self.btn_play.clicked.connect(self.on_play_clicked)
+        self.btn_pause = QPushButton("⏸ PAUSE")
+        self.btn_pause.clicked.connect(self.on_pause_clicked)
+        self.btn_next = QPushButton("⏭ Next")
+        self.btn_next.clicked.connect(self.on_next_clicked)
+        
         btn_layout.addWidget(self.btn_prev)
         btn_layout.addWidget(self.btn_play)
         btn_layout.addWidget(self.btn_pause)
         btn_layout.addWidget(self.btn_next)
         control_layout.addLayout(btn_layout)
-
+        
         vol_layout = QHBoxLayout()
-        vol_layout.addWidget(QLabel("Громкость плеера:"))
+        vol_layout.addWidget(QLabel("Volume:"))
         self.slider_volume = QSlider(Qt.Orientation.Horizontal)
         self.slider_volume.setRange(0, 100)
         self.slider_volume.setValue(80)
-        self.slider_volume.valueChanged.connect(self._on_volume_changed)
+        self.slider_volume.valueChanged.connect(self.on_volume_changed)
         vol_layout.addWidget(self.slider_volume)
         control_layout.addLayout(vol_layout)
-
+        
         right_layout.addWidget(control_box)
-
-        auto_box = QGroupBox("Автоматизация трека (Preset Sync)")
-        auto_layout = QVBoxLayout(auto_box)
-        auto_layout.addWidget(QLabel("Пресеты, привязанные к таймлайну трека:"))
-        self.sync_list = QListWidget()
-        auto_layout.addWidget(self.sync_list)
-
-        sync_btn_layout = QHBoxLayout()
-        sync_btn_layout.addWidget(QPushButton("Добавить маркер пресета"))
-        sync_btn_layout.addWidget(QPushButton("Удалить маркер"))
-        auto_layout.addLayout(sync_btn_layout)
-        right_layout.addWidget(auto_box)
-
+        
+        # Waveform
+        wave_box = QGroupBox("Waveform")
+        wave_layout = QVBoxLayout(wave_box)
+        self.waveform_label = QLabel()
+        self.waveform_label.setMinimumHeight(100)
+        self.waveform_label.setStyleSheet("background-color: #0F0F0F; border: 1px solid #252525;")
+        self.waveform_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.waveform_label.setFont(QFont("Consolas", 8))
+        wave_layout.addWidget(self.waveform_label)
+        right_layout.addWidget(wave_box)
+        
         splitter.addWidget(right_panel)
         splitter.setSizes([500, 700])
         layout.addWidget(splitter)
-
-    def update_tracks(self):
-        self.track_list.clear()
-        tracks = self.main_window.player_service.get_playlist()
-        for t in tracks:
-            item = QListWidgetItem(t.get('name', 'Неизвестный трек'))
-            item.setData(Qt.ItemDataRole.UserRole, t)
-            self.track_list.addItem(item)
-
-    def _on_track_double_clicked(self, item):
-        track_data = item.data(Qt.ItemDataRole.UserRole)
-        self._play_track(track_data)
-
-    def _play_track(self, track_data):
-        if not track_data:
+    
+    def update_player(self):
+        """Update player UI from service"""
+        if not self.main_window.service_manager:
             return
-        self.lbl_current_track.setText(track_data.get('name', 'Трек'))
-        if self.main_window.player_service.play_track(track_data.get('id')):
-            self.main_window.log(
-                f"Воспроизведение трека: {track_data.get('name')}", "info"
-            )
-
-    def _on_play_clicked(self):
-        status = self.main_window.player_service.get_status()
-        if status.get('state') == 'paused':
-            self.main_window.player_service.resume()
-            self.main_window.log("Плеер возобновлен", "info")
-            return
-
-        current = self.main_window.player_service.get_current_track()
-        if current:
-            self.main_window.player_service.play_track(current.id)
-            return
-
-        if self.track_list.count() > 0:
-            self._play_track(self.track_list.item(0).data(Qt.ItemDataRole.UserRole))
-
-    def _on_pause_clicked(self):
-        self.main_window.player_service.pause()
-        self.main_window.log("Воспроизведение приостановлено", "info")
-
-    def _on_prev_clicked(self):
-        next_id = self.main_window.player_service.prev()
-        if next_id:
-            self.main_window.player_service.play_track(next_id)
-            self._sync_ui_with_current_track()
-
-    def _on_next_clicked(self):
-        next_id = self.main_window.player_service.next()
-        if next_id:
-            self.main_window.player_service.play_track(next_id)
-            self._sync_ui_with_current_track()
-
-    def _on_volume_changed(self, value):
-        self.main_window.player_service.set_volume(value / 100.0)
-
-    def _on_slider_moved(self, value):
-        self.main_window.player_service.set_position(value)
-
-    def _sync_ui_with_current_track(self):
-        current = self.main_window.player_service.get_current_track()
-        if current:
-            self.lbl_current_track.setText(current.name)
-
-    def _update_playback_progress(self):
-        status = self.main_window.player_service.get_status()
-        if not isinstance(status, dict):
-            return
-
-        self.slider_progress.setRange(0, int(status.get('duration', 1)))
-        self.slider_progress.setValue(int(status.get('position', 0)))
-        self.lbl_time_cur.setText(self._format_time(status.get('position', 0)))
-        self.lbl_time_total.setText(self._format_time(status.get('duration', 0)))
-
-    def _format_time(self, seconds):
+        
+        try:
+            if not self.main_window.service_manager.is_running('player'):
+                return
+            
+            status = self.main_window.service_manager.get_service_status('player')
+            if not status:
+                return
+            
+            details = status.get('details', {})
+            current = details.get('current_track')
+            state = details.get('state', 'stopped')
+            position = details.get('position', 0)
+            duration = details.get('duration', 0)
+            volume = details.get('volume', 1.0)
+            vu = details.get('vu_meter', {})
+            
+            # Update track info
+            if current:
+                self.lbl_current_track.setText(current.get('name', 'Unknown'))
+            
+            # Update progress
+            if duration > 0:
+                self.slider_progress.setRange(0, int(duration))
+                self.slider_progress.setValue(int(position))
+                self.lbl_time_cur.setText(self.format_time(position))
+                self.lbl_time_total.setText(self.format_time(duration))
+            
+            # Update volume
+            self.slider_volume.setValue(int(volume * 100))
+            
+            # Update waveform
+            if current:
+                track_id = current.get('id')
+                if track_id:
+                    waveform = self.main_window.service_manager.get_service_status('player')
+                    # Would get waveform from service
+                    pass
+            
+        except Exception as e:
+            self.main_window.log(f"Player update error: {e}", "error")
+    
+    def format_time(self, seconds):
         mins = int(seconds) // 60
         secs = int(seconds) % 60
         return f"{mins:02d}:{secs:02d}"
+    
+    def on_track_double_clicked(self, item):
+        track_data = item.data(Qt.ItemDataRole.UserRole)
+        if track_data:
+            self.play_track(track_data.get('id'))
+    
+    def play_track(self, track_id):
+        if not self.main_window.service_manager:
+            return
+        # Would call player service
+        self.main_window.log(f"Play track: {track_id}", "info")
+    
+    def on_play_clicked(self):
+        self.main_window.log("Play clicked", "info")
+    
+    def on_pause_clicked(self):
+        self.main_window.log("Pause clicked", "info")
+    
+    def on_prev_clicked(self):
+        self.main_window.log("Previous track", "info")
+    
+    def on_next_clicked(self):
+        self.main_window.log("Next track", "info")
+    
+    def on_volume_changed(self, value):
+        self.main_window.log(f"Volume: {value}%", "info")
+    
+    def on_slider_moved(self, value):
+        self.main_window.log(f"Seek: {value}s", "info")
 
 
 class SettingsTab(QWidget):
-    """Вкладка настроек аудио, MIDI и сервера"""
-
+    """Settings tab"""
+    
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
         self.init_ui()
-
+    
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
-
+        
         grid = QGridLayout()
-
-        audio_box = QGroupBox("Настройки звукового движка ASIO")
+        
+        # Audio settings
+        audio_box = QGroupBox("Audio Engine")
         audio_layout = QVBoxLayout(audio_box)
-
-        audio_layout.addWidget(QLabel("ASIO Драйвер:"))
+        
+        audio_layout.addWidget(QLabel("Sample Rate:"))
+        self.combo_sr = QComboBox()
+        self.combo_sr.addItems(["44100", "48000", "88200", "96000"])
+        self.combo_sr.setCurrentText("48000")
+        audio_layout.addWidget(self.combo_sr)
+        
+        audio_layout.addWidget(QLabel("Block Size:"))
+        self.combo_bs = QComboBox()
+        self.combo_bs.addItems(["32", "64", "128", "256", "512"])
+        self.combo_bs.setCurrentText("64")
+        audio_layout.addWidget(self.combo_bs)
+        
+        audio_layout.addWidget(QLabel("ASIO Driver:"))
         self.combo_asio = QComboBox()
-        self.combo_asio.addItems([
-            "ASIO4ALL v2", "FL Studio ASIO", "Focusrite USB ASIO", "Behringer USB ASIO"
-        ])
+        self.combo_asio.addItems(["Auto", "ASIO4ALL v2", "FL Studio ASIO", "Focusrite USB ASIO"])
         audio_layout.addWidget(self.combo_asio)
-
-        audio_layout.addWidget(QLabel("Размер буфера (Latency):"))
-        self.combo_buffer = QComboBox()
-        self.combo_buffer.addItems(["64 samples", "128 samples", "256 samples", "512 samples"])
-        self.combo_buffer.setCurrentIndex(2)
-        audio_layout.addWidget(self.combo_buffer)
-
-        self.btn_restart_audio = QPushButton("Перезапустить аудио движок")
-        self.btn_restart_audio.clicked.connect(self._restart_audio)
+        
+        self.btn_restart_audio = QPushButton("Restart Audio Engine")
+        self.btn_restart_audio.clicked.connect(self.restart_audio)
         audio_layout.addWidget(self.btn_restart_audio)
+        
         grid.addWidget(audio_box, 0, 0)
-
-        midi_box = QGroupBox("Параметры MIDI контроллера")
-        midi_layout = QVBoxLayout(midi_box)
-
-        midi_layout.addWidget(QLabel("Входной MIDI порт:"))
-        self.combo_midi_in = QComboBox()
-        self.combo_midi_in.addItems([
-            "Arduino USB MIDI", "LoopMIDI Port 1", "Компьютерный MIDI вход"
-        ])
-        midi_layout.addWidget(self.combo_midi_in)
-
-        midi_layout.addWidget(QLabel("Режим обработки педали:"))
-        self.combo_midi_mode = QComboBox()
-        self.combo_midi_mode.addItems([
-            "Прямой переключатель (Stomp)",
-            "Банковый режим (Banks)",
-            "Студийный пресет-матрица"
-        ])
-        midi_layout.addWidget(self.combo_midi_mode)
-        grid.addWidget(midi_box, 0, 1)
-
-        com_box = QGroupBox("Подключение ножного контроллера")
-        com_layout = QVBoxLayout(com_box)
-
-        com_layout.addWidget(QLabel("Последовательный COM-порт:"))
-        self.combo_com = QComboBox()
-        self.combo_com.addItems(["COM1", "COM3", "COM5 (Bluetooth HC-05)", "COM6"])
-        com_layout.addWidget(self.combo_com)
-
-        self.btn_connect_com = QPushButton("Установить соединение")
-        self.btn_connect_com.clicked.connect(self._connect_com)
-        com_layout.addWidget(self.btn_connect_com)
-        grid.addWidget(com_box, 1, 0)
-
-        web_box = QGroupBox("Сервер мобильного приложения")
-        web_layout = QVBoxLayout(web_box)
-
-        self.lbl_server_ip = QLabel("Локальный адрес сервера: http://192.168.1.50:5000")
-        self.lbl_server_ip.setStyleSheet("color: #FF9D00; font-weight: bold;")
-        web_layout.addWidget(self.lbl_server_ip)
-
+        
+        # Service toggles
+        services_box = QGroupBox("Service Control")
+        services_layout = QVBoxLayout(services_box)
+        
+        self.service_checkboxes = {}
+        services = [
+            ('audio', 'Audio Engine'),
+            ('player', 'Backing Track Player'),
+            ('firebase', 'Firebase'),
+            ('qr', 'QR Generator'),
+            ('ble', 'Bluetooth LE'),
+            ('webrtc', 'WebRTC'),
+            ('preset_scan', 'Preset Catalog'),
+            ('api_server', 'API Server'),
+        ]
+        
+        for name, label in services:
+            cb = QCheckBox(label)
+            cb.setChecked(True)
+            cb.toggled.connect(lambda checked, n=name: self.toggle_service(n, checked))
+            services_layout.addWidget(cb)
+            self.service_checkboxes[name] = cb
+        
+        grid.addWidget(services_box, 0, 1)
+        
+        # QR Code
+        qr_box = QGroupBox("QR Code")
+        qr_layout = QVBoxLayout(qr_box)
+        
         self.qr_label = QLabel()
         self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.qr_label.setMinimumSize(120, 120)
-        web_layout.addWidget(self.qr_label)
-        grid.addWidget(web_box, 1, 1)
-
+        self.qr_label.setMinimumSize(200, 200)
+        self.qr_label.setStyleSheet("background-color: white; border: 1px solid #2D2D2D;")
+        qr_layout.addWidget(self.qr_label)
+        
+        self.btn_refresh_qr = QPushButton("Refresh QR")
+        self.btn_refresh_qr.clicked.connect(self.refresh_qr)
+        qr_layout.addWidget(self.btn_refresh_qr)
+        
+        grid.addWidget(qr_box, 1, 0)
+        
+        # Network info
+        net_box = QGroupBox("Network")
+        net_layout = QVBoxLayout(net_box)
+        
+        self.lbl_api = QLabel("API Server: http://localhost:5000")
+        self.lbl_api.setStyleSheet("color: #FF9D00; font-weight: bold;")
+        net_layout.addWidget(self.lbl_api)
+        
+        grid.addWidget(net_box, 1, 1)
+        
         layout.addLayout(grid)
-
-        perf_box = QGroupBox("Performance & DSP Монитор")
-        perf_layout = QHBoxLayout(perf_box)
-        perf_layout.addWidget(QLabel("Загрузка DSP:"))
-        self.dsp_progress = QProgressBar()
-        self.dsp_progress.setValue(14)
-        self.dsp_progress.setStyleSheet("QProgressBar::chunk { background-color: #FF9D00; }")
-        perf_layout.addWidget(self.dsp_progress)
-        layout.addWidget(perf_box)
-
-        self.generate_qr()
-
-    def generate_qr(self):
-        try:
-            qr_pixmap = QRGenerator.generate_room_qr(
-                "http://192.168.1.50:5000", "GR7_SECURE_AUTH"
-            )
-            if qr_pixmap and not qr_pixmap.isNull():
-                self.qr_label.setPixmap(qr_pixmap.scaled(120, 120, Qt.AspectRatioMode.KeepAspectRatio))
+        layout.addStretch()
+    
+    def restart_audio(self):
+        self.main_window.log("Restarting audio engine...", "info")
+        if self.main_window.service_manager:
+            asyncio.create_task(self.main_window.service_manager.restart_service('audio'))
+    
+    def toggle_service(self, name: str, enabled: bool):
+        if self.main_window.service_manager:
+            if enabled:
+                self.main_window.service_manager.enable_service(name)
             else:
-                self.qr_label.setText("[ QR код недоступен ]")
-        except Exception as e:
-            self.qr_label.setText("[ Ошибка QR ]")
-            self.main_window.log(f"Ошибка генерации QR: {e}", "error")
-
-    def _restart_audio(self):
-        driver = self.combo_asio.currentText()
-        result = self.main_window.audio_service.configure_device(driver)
-        if result:
-            self.main_window.log(f"Перезапуск аудио драйвера {driver} выполнен", "info")
-        else:
-            self.main_window.log(
-                f"Изменение ASIO драйвера {driver} не поддерживается текущим движком", "warning"
-            )
-
-    def _connect_com(self):
-        self.main_window.log("Попытка установить соединение с COM-портом...", "info")
-        self.main_window.log("Реальное подключение COM-порта не реализовано в текущей версии", "warning")
-
-
-class MIDITab(QWidget):
-    """Вкладка управления MIDI"""
-
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        status_box = QGroupBox("Статус MIDI")
-        status_layout = QVBoxLayout(status_box)
-        self.midi_status = QLabel("MIDI: не инициализирован")
-        status_layout.addWidget(self.midi_status)
-
-        self.btn_refresh = QPushButton("Обновить статус MIDI")
-        self.btn_refresh.clicked.connect(self.update_status)
-        status_layout.addWidget(self.btn_refresh)
-
-        self.btn_send_pc = QPushButton("Отправить Program Change")
-        self.btn_send_pc.clicked.connect(self._send_program_change)
-        status_layout.addWidget(self.btn_send_pc)
-
-        layout.addWidget(status_box)
-        layout.addStretch()
-
-    def update_status(self):
-        status = self.main_window.midi_service.get_status()
-        if status.get('initialized'):
-            port_active = status.get('port_active', False)
-            text = "MIDI: активен" if port_active else "MIDI: инициализирован, порт не активен"
-        else:
-            text = "MIDI: не инициализирован"
-        self.midi_status.setText(text)
-
-    def _send_program_change(self):
-        if self.main_window.midi_service.send_program_change(0):
-            self.main_window.log("MIDI Program Change отправлен", "info")
-        else:
-            self.main_window.log("Ошибка отправки MIDI Program Change", "error")
-
-
-class NetworkTab(QWidget):
-    """Вкладка состояния сети и API"""
-
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-
-        self.server_status = QLabel("API сервер: остановлен")
-        layout.addWidget(self.server_status)
-
-        self.btn_restart_server = QPushButton("Перезапустить API сервер")
-        self.btn_restart_server.clicked.connect(self._restart_api_server)
-        layout.addWidget(self.btn_restart_server)
-
-        self.btn_show_port = QPushButton("Показать порт API")
-        self.btn_show_port.clicked.connect(self._show_api_port)
-        layout.addWidget(self.btn_show_port)
-
-        layout.addStretch()
-
-    def update_status(self):
-        if self.main_window.api_server.is_running():
-            self.server_status.setText(
-                f"API сервер запущен на порту {self.main_window.api_server.get_port()}"
-            )
-        else:
-            self.server_status.setText("API сервер: остановлен")
-
-    def _restart_api_server(self):
-        success = self.main_window.api_server.start()
-        if success:
-            self.main_window.log("API сервер запущен", "info")
-        else:
-            self.main_window.log("Не удалось запустить API сервер", "error")
-        self.update_status()
-
-    def _show_api_port(self):
-        port = self.main_window.api_server.get_port()
-        self.main_window.log(f"API порт: {port}", "info")
-        self.server_status.setText(f"API сервер порт: {port}")
+                self.main_window.service_manager.disable_service(name)
+            self.main_window.log(f"Service {name}: {'enabled' if enabled else 'disabled'}", "info")
+    
+    def refresh_qr(self):
+        self.main_window.log("Refreshing QR...", "info")
+        # Would call QR service
 
 
 class LogsTab(QWidget):
-    """Вкладка системных логов"""
-
+    """System logs with filtering"""
+    
     def __init__(self, main_window):
         super().__init__()
         self.main_window = main_window
         self.init_ui()
-
+        self._setup_log_filter()
+    
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-
-        self.log_widget = QTextEdit()
+        
+        # Toolbar
+        toolbar = QHBoxLayout()
+        
+        self.filters = {}
+        categories = ['BOOT', 'AUDIO', 'FIREBASE', 'WEBRTC', 'BLE', 'PLAYER', 'QR', 'PRESET', 'UI', 'SYSTEM']
+        
+        for cat in categories:
+            cb = QCheckBox(cat)
+            cb.setChecked(True)
+            cb.toggled.connect(self.apply_filter)
+            toolbar.addWidget(cb)
+            self.filters[cat] = cb
+        
+        toolbar.addStretch()
+        
+        self.btn_clear = QPushButton("Clear")
+        self.btn_clear.clicked.connect(self.clear_logs)
+        toolbar.addWidget(self.btn_clear)
+        
+        layout.addLayout(toolbar)
+        
+        # Log widget
+        self.log_widget = QPlainTextEdit()
         self.log_widget.setReadOnly(True)
+        self.log_widget.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #0F0F0F;
+                border: 1px solid #252525;
+                color: #A0A0A0;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 11px;
+                line-height: 1.4;
+            }
+        """)
         layout.addWidget(self.log_widget)
-
+    
+    def _setup_log_filter(self):
+        pass
+    
+    def apply_filter(self):
+        self.clear_logs()
+        # Re-apply filtered messages from history
+        # For simplicity, just clear
+    
+    def clear_logs(self):
+        self.log_widget.clear()
+    
     def append_message(self, formatted_msg: str):
-        self.log_widget.append(formatted_msg)
-        self.log_widget.moveCursor(QTextCursor.MoveOperation.End)
-
-
-class WebRTCTab(QWidget):
-    """Вкладка WebRTC и транспорта"""
-
-    def __init__(self, main_window):
-        super().__init__()
-        self.main_window = main_window
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Мониторинг WebRTC и состояния транспорта"))
-
-        webrtc_box = QGroupBox("Статус аудиостриминга WebRTC")
-        webrtc_layout = QVBoxLayout(webrtc_box)
-        self.webrtc_status = QLabel("Поток остановлен. Комната ожидания: не создана")
-        webrtc_layout.addWidget(self.webrtc_status)
-        layout.addWidget(webrtc_box)
-        layout.addStretch()
-
-    def update_transport(self):
-        status = self.main_window.webrtc_service.get_status()
-        if status.get('initialized'):
-            room_id = status.get('room_id') or 'не создана'
-            self.webrtc_status.setText(f"WebRTC: подключено, комната: {room_id}")
-        else:
-            self.webrtc_status.setText("WebRTC: остановлено или не инициализировано")
+        # Check filter
+        show = True
+        for cat, cb in self.filters.items():
+            if cb.isChecked() and cat in formatted_msg:
+                show = True
+                break
+            elif not cb.isChecked() and cat in formatted_msg:
+                show = False
+        
+        if show:
+            self.log_widget.appendHtml(formatted_msg)
+            self.log_widget.verticalScrollBar().setValue(
+                self.log_widget.verticalScrollBar().maximum()
+            )
 
 
 class MainWindow(QMainWindow):
-    """Главное окно приложения"""
-
-    def __init__(self):
+    """Main application window"""
+    
+    def __init__(self, logger: Logger):
         super().__init__()
+        self.logger = logger
         self.gui_signals = GUISignals()
         self.gui_signals.log_signal.connect(self.log_widget_safe_append)
-
-        self.setWindowTitle("GR7 Hub - Пульт управления Guitar Rig 7")
-        self.setGeometry(100, 100, 1200, 800)
-
-        self.config_loader = ConfigLoader()
-        self.state_manager = StateManager()
-        self.logger = Logger("MainWindow")
-
-        self.plugin_service = PluginService(
-            self.config_loader, self.state_manager, self.logger
-        )
-        self.audio_service = AudioService(
-            self.config_loader, self.state_manager, self.logger
-        )
-        self.midi_service = MIDIService(
-            self.config_loader, self.state_manager, self.logger
-        )
-        self.webrtc_service = WebRTCService(
-            self.config_loader, self.state_manager, self.logger
-        )
-        self.player_service = PlayerService(self.config_loader, self.logger)
-        self.preset_catalog = PresetCatalog(self.config_loader, self.logger)
-
-        self.api_server = APIServer(
-            self.config_loader,
-            self.logger,
-            self.preset_catalog,
-            player_service=self.player_service,
-            plugin_service=self.plugin_service
-        )
-
+        self.gui_signals.service_status_signal.connect(self.on_service_status)
+        self.gui_signals.bootstrap_phase_signal.connect(self.on_bootstrap_phase)
+        self.gui_signals.bootstrap_complete_signal.connect(self.on_bootstrap_complete)
+        self.gui_signals.bootstrap_error_signal.connect(self.on_bootstrap_error)
+        self.gui_signals.vu_meter_signal.connect(self.on_vu_meter)
+        self.gui_signals.waveform_signal.connect(self.on_waveform)
+        
+        self.service_manager: Optional[ServiceManager] = None
+        self.config_loader = None
+        
+        self.setWindowTitle("GR7 Hub - Guitar Rig 7 Control Center")
+        self.setGeometry(100, 100, 1400, 900)
+        
         self.init_ui()
-
-        threading.Thread(target=self._init_services, daemon=True).start()
-        QTimer.singleShot(300, self._init_vst_safe)
-
-        self.ui_timer = QTimer()
-        self.ui_timer.setInterval(100)
-        self.ui_timer.timeout.connect(self._update_status)
-        self.ui_timer.start()
-
+        
+        # Apply theme
+        GR7Style.apply_theme(QApplication.instance())
+        self.setStyleSheet(GR7Style.get_stylesheet())
+    
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-
+        
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(5, 5, 5, 5)
-
+        
+        # Header
         header_frame = QFrame()
         header_frame.setFrameShape(QFrame.Shape.StyledPanel)
         header_frame.setStyleSheet(
@@ -814,102 +1170,136 @@ class MainWindow(QMainWindow):
         )
         header_layout = QHBoxLayout(header_frame)
         header_layout.setContentsMargins(15, 0, 15, 0)
-
+        
         title_lbl = QLabel("GUITAR RIG 7 STAGE CONTROL HUB")
         title_lbl.setStyleSheet(
             "font-weight: bold; font-size: 13px; color: #E0E0E0; letter-spacing: 1px;"
         )
         header_layout.addWidget(title_lbl)
         header_layout.addStretch()
-
-        self.system_status = QLabel("Запуск системных подсистем...")
+        
+        self.system_status = QLabel("Initializing...")
         self.system_status.setStyleSheet("color: #888888; font-size: 11px;")
         header_layout.addWidget(self.system_status)
         main_layout.addWidget(header_frame)
-
+        
+        # Tabs
         self.tabs = QTabWidget()
+        
+        self.dashboard_tab = ServiceDashboardTab(self)
+        self.audio_monitor_tab = AudioMonitorTab(self)
         self.preset_browser_tab = PresetBrowserTab(self)
-        self.audio_player_tab = AudioPlayerTab(self)
-        self.midi_tab = MIDITab(self)
-        self.webrtc_tab = WebRTCTab(self)
-        self.network_tab = NetworkTab(self)
+        self.player_tab = PlayerTab(self)
         self.settings_tab = SettingsTab(self)
         self.logs_tab = LogsTab(self)
-
-        self.tabs.addTab(self.preset_browser_tab, "Пресеты")
-        self.tabs.addTab(self.audio_player_tab, "Плеер")
-        self.tabs.addTab(self.midi_tab, "MIDI")
-        self.tabs.addTab(self.webrtc_tab, "WebRTC")
-        self.tabs.addTab(self.network_tab, "Сеть")
-        self.tabs.addTab(self.settings_tab, "Настройки")
-        self.tabs.addTab(self.logs_tab, "Логи")
-
+        
+        self.tabs.addTab(self.dashboard_tab, "Dashboard")
+        self.tabs.addTab(self.audio_monitor_tab, "Audio Monitor")
+        self.tabs.addTab(self.preset_browser_tab, "Presets")
+        self.tabs.addTab(self.player_tab, "Player")
+        self.tabs.addTab(self.settings_tab, "Settings")
+        self.tabs.addTab(self.logs_tab, "Logs")
+        
         main_layout.addWidget(self.tabs)
-
-    def _init_services(self):
+        
+        # Status update timer
+        self.status_timer = QTimer()
+        self.status_timer.setInterval(2000)
+        self.status_timer.timeout.connect(self.update_system_status)
+        self.status_timer.start()
+    
+    def set_service_manager(self, service_manager: ServiceManager):
+        """Set service manager after bootstrap"""
+        self.service_manager = service_manager
+        self.logger.log("Service manager connected to UI", "success")
+        
+        # Register state change callback
+        service_manager.register_state_change_callback(self.on_service_state_change)
+        
+        # Update dashboard
+        self.dashboard_tab.update_all_services()
+        
+        # Update preset browser
+        self.preset_browser_tab.update_presets()
+        
+        # Update player
+        self.player_tab.update_player()
+    
+    def on_service_state_change(self, name: str, old_state: ServiceState, new_state: ServiceState):
+        """Handle service state changes"""
+        self.logger.log(f"Service {name}: {old_state.value} -> {new_state.value}", "info")
+        if self.service_manager:
+            status = self.service_manager.get_service_status(name)
+            if status:
+                self.dashboard_tab.update_service_widget(name, status)
+    
+    def on_service_status(self, name: str, status: Dict[str, Any]):
+        """Handle service status update"""
+        self.dashboard_tab.update_service_widget(name, status)
+    
+    def on_bootstrap_phase(self, phase: str):
+        """Handle bootstrap phase change"""
+        self.system_status.setText(f"Bootstrap: {phase}")
+        self.logger.log(f"Bootstrap phase: {phase}", "info")
+    
+    def on_bootstrap_complete(self, result: Dict[str, Any]):
+        """Handle bootstrap completion"""
+        success = result.get('success', False)
+        if success:
+            self.system_status.setText("All services started successfully")
+            self.logger.log("Bootstrap completed successfully", "success")
+        else:
+            self.system_status.setText("Bootstrap completed with errors")
+            self.logger.log("Bootstrap completed with errors", "error")
+        
+        # Update service checkboxes
+        if self.service_manager:
+            statuses = self.service_manager.get_all_status()
+            for name, status in statuses.items():
+                cb = self.settings_tab.service_checkboxes.get(name)
+                if cb:
+                    cb.setChecked(status.get('state') != 'disabled')
+    
+    def on_bootstrap_error(self, error: str):
+        """Handle bootstrap error"""
+        self.system_status.setText(f"Bootstrap error: {error}")
+        self.logger.log(f"Bootstrap error: {error}", "error")
+    
+    def on_vu_meter(self, vu_data: Dict[str, float]):
+        """Handle VU meter update"""
+        # Audio monitor tab handles this via timer
+        pass
+    
+    def on_waveform(self, waveform_data: Dict[str, list]):
+        """Handle waveform update"""
+        pass
+    
+    def update_system_status(self):
+        """Update system status in header"""
+        if not self.service_manager:
+            return
+        
         try:
-            self.logger.log("[BOOT] PresetCatalog init start", "info")
-            if self.preset_catalog.initialize():
-                self.logger.log("[BOOT] PresetCatalog init complete", "info")
-                QTimer.singleShot(0, self.preset_browser_tab.update_presets)
-            else:
-                self.logger.log("[BOOT] PresetCatalog init failed", "error")
-
-            self.logger.log("[BOOT] PlayerService init start", "info")
-            if self.player_service.initialize():
-                self.logger.log("[BOOT] PlayerService init complete", "info")
-                QTimer.singleShot(0, self.audio_player_tab.update_tracks)
-            else:
-                self.logger.log("[BOOT] PlayerService init failed", "error")
-
-            self.logger.log("[BOOT] API Server init start", "info")
-            if self.api_server.start():
-                self.logger.log("[BOOT] API Server запущен", "info")
-            else:
-                self.logger.log("[BOOT] API Server запуск провален", "error")
-
-            self.logger.log("[BOOT] Фоновые службы инициализированы", "success")
+            statuses = self.service_manager.get_all_status()
+            running = sum(1 for s in statuses.values() if s.get('state') == 'running')
+            degraded = sum(1 for s in statuses.values() if s.get('state') == 'degraded')
+            failed = sum(1 for s in statuses.values() if s.get('state') == 'failed')
+            total = len(statuses)
+            
+            self.system_status.setText(
+                f"Services: {running}/{total} running | "
+                f"{degraded} degraded | {failed} failed"
+            )
         except Exception as e:
-            self.logger.log(f"[BOOT] Ошибка фоновой инициализации служб: {e}", "error")
-
-    def _init_vst_safe(self):
-        try:
-            self.logger.log("[BOOT] VST3 init start", "info")
-            if self.plugin_service.initialize():
-                self.logger.log("[BOOT] VST3 подгружен успешно", "info")
-            else:
-                self.logger.log("[BOOT] VST3 не указан в config.ini или не найден.", "warning")
-        except Exception as e:
-            self.logger.log(f"[BOOT] Ошибка инициализации VST3: {e}", "error")
-
-    def _update_status(self):
-        try:
-            self.preset_browser_tab._update_rack_chain()
-            self.midi_tab.update_status()
-            self.webrtc_tab.update_transport()
-            self.network_tab.update_status()
-        except Exception as e:
-            self.logger.log(f"Ошибка таймера обновления вкладок: {e}", "error")
-
-        try:
-            state = self.state_manager.state.get_state_dict()
-        except Exception:
-            state = {}
-
-        status_text = (
-            f"VST3: {'OK' if state.get('plugin_loaded') else 'NO'} | "
-            f"Audio: {'OK' if state.get('audio_engine_active') else 'NO'} | "
-            f"MIDI: {'OK' if state.get('midi_active') else 'NO'} | "
-            f"WebRTC: {'OK' if state.get('webrtc_active') else 'NO'} | "
-            f"API: {'OK' if self.api_server.is_running() else 'NO'}"
-        )
-        self.system_status.setText(status_text)
-
+            self.logger.log(f"Status update error: {e}", "error")
+    
     def log(self, message: str, level: str = "info"):
+        """Log message"""
         self.logger.log(message, level)
         self.gui_signals.log_signal.emit(message, level)
-
+    
     def log_widget_safe_append(self, message: str, level: str):
+        """Append to log widget (thread-safe)"""
         color = "#A0A0A0"
         if level == "error":
             color = "#FF3333"
@@ -917,19 +1307,25 @@ class MainWindow(QMainWindow):
             color = "#33FF33"
         elif level == "warning":
             color = "#FF9D00"
-
+        
         formatted_msg = f"<span style='color:{color};'>[{level.upper()}] {message}</span>"
-        if hasattr(self, 'logs_tab') and self.logs_tab is not None:
-            self.logs_tab.append_message(formatted_msg)
-
+        self.logs_tab.append_message(formatted_msg)
+    
     def closeEvent(self, event):
-        try:
-            self.api_server.stop()
-            self.plugin_service.shutdown()
-            self.audio_service.shutdown()
-            self.midi_service.shutdown()
-            self.webrtc_service.shutdown()
-            self.player_service.shutdown()
-        except Exception:
-            pass
+        """Handle close event"""
+        self.logger.log("Shutting down...", "info")
+        
+        if self.service_manager:
+            # Stop all services
+            import asyncio
+            loop = asyncio.new_event_loop()
+            loop.run_until_complete(self.service_manager.stop_all())
+            loop.close()
+        
         event.accept()
+
+
+# For backward compatibility
+def create_main_window(logger: Logger) -> MainWindow:
+    """Factory function to create main window"""
+    return MainWindow(logger)

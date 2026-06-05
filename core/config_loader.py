@@ -87,3 +87,28 @@ class ConfigLoader:
     def get_all(self) -> Dict[str, Dict[str, str]]:
         """Получение всех секций"""
         return {section: dict(self.config[section]) for section in self.config}
+    
+    def load_services_config(self) -> Dict[str, bool]:
+        """Load service enable/disable configuration from config.ini"""
+        # Check if services section exists
+        if 'services' not in self.config:
+            # Create default services config
+            self.config['services'] = {
+                'audio': 'true',
+                'firebase': 'false',
+                'webrtc': 'false',
+                'ble': 'false',
+                'api_server': 'true',
+                'qr': 'true',
+                'midi': 'false',
+                'preset_scan': 'true',
+                'player': 'true',
+                'vst3': 'true',
+            }
+            self._save()
+        
+        services = {}
+        for key, value in self.config['services'].items():
+            services[key] = value.lower() in ('true', '1', 'yes', 'on')
+        
+        return services

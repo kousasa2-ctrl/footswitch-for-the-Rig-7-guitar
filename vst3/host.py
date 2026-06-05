@@ -211,33 +211,100 @@ class VST3Host:
             return False
 
         try:
-            # Получаем параметры плагина и пытаемся найти соответствующий
-            params = self.plugin.get_parameters()
+            # Безопасно получаем параметры (lazy, не в boot path)
+            try:
+                params = self.plugin.get_parameters()
+            except Exception as e:
+                if self.logger:
+                    self.logger.log_vst(f"Не удалось получить параметры: {e}", "warning")
+                return False
+
+            if not params or not isinstance(params, dict):
+                return False
+
+            # Ищем соответствующий параметр
             for param_name, param_value in params.items():
-                if controller == int(param_value * 127):
-                    self.plugin.set_parameter(param_name, value / 127.0)
-                    if self.logger:
-                        self.logger.log_vst(f"CC {controller} -> {param_name}", "success")
-                    return True
+                try:
+                    # Безопасно преобразуем параметр в число
+                    try:
+                        numeric_value = float(param_value)
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    # Сравниваем с контроллером
+                    if controller == int(numeric_value * 127):
+                        self.plugin.set_parameter(param_name, value / 127.0)
+                        if self.logger:
+                            self.logger.log_vst(f"CC {controller} -> {param_name}", "success")
+                        return True
+                except Exception:
+                    continue
+            
             return False
         except Exception as e:
             if self.logger:
                 self.logger.log_vst(f"Ошибка отправки CC: {e}", "error")
             return False
 
+    def get_parameter_names(self) -> List[str]:
+        """
+        Безопасное получение списка имен параметров плагина.
+        
+        Вместо использования super() и прямого доступа к атрибутам,
+        использует безопасный подход с проверкой наличия параметров.
+
+        Returns:
+            List[str]: Список имен параметров или пустой список
+        """
+        if not self.plugin or not self.plugin.is_loaded:
+            if self.logger:
+                self.logger.log_vst("Плагин не загружен для получения параметров", "warning")
+            return []
+
+        try:
+            # Пытаемся получить параметры безопасно
+            params = self.plugin.get_parameters()
+            if params and isinstance(params, dict):
+                param_names = list(params.keys())
+                if self.logger:
+                    self.logger.log_vst(f"Получено {len(param_names)} параметров плагина", "info")
+                return param_names
+            return []
+        except Exception as e:
+            if self.logger:
+                self.logger.log_vst(f"Ошибка получения списка параметров: {e}", "warning")
+            return []
+
+    def is_plugin_loaded(self) -> bool:
+        """
+        Lightweight проверка загрузки плагина (без introspection).
+
+        Returns:
+            bool: True если плагин загружен
+        """
+        return self.plugin is not None and self.plugin.is_loaded
+
     def get_status(self) -> dict:
         """
-        Получение статуса хоста.
+        Получение статуса хоста (с lazy introspection).
+
+        ВНИМАНИЕ: get_info() вызывает тяжелую introspection через pedalboard.
+        Должен быть вызван только после GUI загрузки.
 
         Returns:
             dict: Статус
         """
         status = {
             'initialized': self.plugin is not None,
-            'plugin_loaded': self.plugin.is_loaded if self.plugin else False,
-            'audio_running': self._running,
-            'info': self.plugin.get_info() if self.plugin else {}
+            'plugin_loaded': self.is_plugin_loaded(),
+            'audio_running': self._running
         }
+        # Lazy introspection: только если не в boot path
+        if self.plugin and self.plugin.is_loaded:
+            try:
+                status['info'] = self.plugin.get_info()
+            except Exception:
+                status['info'] = {}
         return status
 
     def shutdown(self) -> None:
